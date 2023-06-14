@@ -27,7 +27,12 @@ target_link_libraries(ota
 	pico_multicore
 	libdvi
 	pico_cyw43_arch_lwip_poll
+	hardware_flash
 )
+
+# Custom linker script to load critical code to RAM (DVI stuff, ...)
+pico_set_binary_type(ota copy_to_ram)	# Needed to set PICO_COPY_TO_RAM and have boot code copy "ram_text" section to RAM
+pico_set_linker_script(ota ${CMAKE_CURRENT_SOURCE_DIR}/memmap_dvi_in_ram.ld)
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(ota)

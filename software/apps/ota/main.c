@@ -8,6 +8,7 @@
 #include "hardware/sync.h"
 #include "hardware/gpio.h"
 #include "hardware/vreg.h"
+#include "hardware/flash.h"
 
 #include "dvi.h"
 #include "dvi_serialiser.h"
@@ -125,16 +126,66 @@ void core1_main() {
 }
 
 
+// Firmware is flashed at a 1MB offset (0x100000)
+#define FLASH_TARGET_OFFSET (1024 * 1024)
+const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
+
+void print_buf(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        printf("%02x", buf[i]);
+        if (i % 16 == 15)
+            printf("\n");
+        else
+            printf(" ");
+    }
+}
+
+bool program_flash() {
+	// FIXME get data as param
+    uint8_t data[FLASH_PAGE_SIZE];
+    for (int i = 0; i < FLASH_PAGE_SIZE; ++i)
+        data[i] = i % 128;
+
+    printf("Generated data:\n");
+    print_buf(data, FLASH_PAGE_SIZE);
+
+    // Note that a whole number of sectors must be erased at a time.
+    printf("\nErasing target region...\n");
+    flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
+    printf("Done. Read back target region:\n");
+    print_buf(flash_target_contents, FLASH_PAGE_SIZE);
+
+    printf("\nProgramming target region...\n");
+    flash_range_program(FLASH_TARGET_OFFSET, data, FLASH_PAGE_SIZE);
+    printf("Done. Read back target region:\n");
+    print_buf(flash_target_contents, FLASH_PAGE_SIZE);
+
+    bool mismatch = false;
+    for (int i = 0; i < FLASH_PAGE_SIZE; ++i) {
+        if (data[i] != flash_target_contents[i])
+            mismatch = true;
+    }
+    if (mismatch)
+        printf("Programming failed!\n");
+    else
+        printf("Programming successful!\n");
+	
+	return mismatch;
+}
+
+
 #define TCP_PORT 80
 #define DEBUG_printf printf
 #define POLL_TIME_S 5
 #define HTTP_GET "GET"
+#define HTTP_POST "POST"
 #define HTTP_RESPONSE_HEADERS "HTTP/1.1 %d OK\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define LED_TEST_BODY "<html><body><h1>Hello from Pico W.</h1><p>Led is %s</p><p><a href=\"?led=%d\">Turn led %s</a></body></html>"
-#define LED_PARAM "led=%d"
-#define LED_TEST "/ledtest"
-#define LED_GPIO 0
-#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" LED_TEST "\n\n"
+#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><form method=\"POST\" action=\"%s\"><input type=\"file\" id=\"firmware\" name=\"firmware\" accept=\"uf2\" /><input type=\"submit\" value=\"Upgrade\" /></form></body></html>"
+#define OTA_BODY_SUCCESS "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade successful!</h2></body></html>"
+#define OTA_BODY_FAILURE "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade Failed!</h2></body></html>"
+#define FIRMWARE_PARAM "firmware=%d"
+#define OTA_PATH "/ota"
+#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" OTA_PATH "\n\n"
 
 typedef struct TCP_SERVER_T_ {
     struct tcp_pcb *server_pcb;
@@ -194,30 +245,32 @@ static err_t tcp_server_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
 
 static int test_server_content(const char *request, const char *params, char *result, size_t max_result_len) {
     int len = 0;
-    if (strncmp(request, LED_TEST, sizeof(LED_TEST) - 1) == 0) {
-        // Get the state of the led
-        bool value;
-        cyw43_gpio_get(&cyw43_state, LED_GPIO, &value);
-        int led_state = value;
-
-        // See if the user changed it
-        if (params) {
-            int led_param = sscanf(params, LED_PARAM, &led_state);
-            if (led_param == 1) {
-                if (led_state) {
-                    // Turn led on
-                    cyw43_gpio_set(&cyw43_state, 0, true);
-                } else {
-                    // Turn led off
-                    cyw43_gpio_set(&cyw43_state, 0, false);
-                }
-            }
-        }
+    if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
         // Generate result
-        if (led_state) {
-            len = snprintf(result, max_result_len, LED_TEST_BODY, "ON", 0, "OFF");
+        len = snprintf(result, max_result_len, OTA_BODY, OTA_PATH);
+    }
+    return len;
+}
+
+static int test_server_content_upload(const char *request, const char *params, char *result, size_t max_result_len) {
+    int len = 0;
+    if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
+		printlinef(WHITE, BLACK, "Upload POST request.");
+        // See if the user uploaded a firmware
+		// TODO Handle file upload
+		// TODO program flash
+		// TODO read from programmed flash ??
+		bool isUpgradeOk = program_flash() == 0;
+
+		printlinef(WHITE, BLACK, "Programmed flash with value: 0x%08x", *((uint32_t*)flash_target_contents));
+
+        // Generate result
+        if (isUpgradeOk) {
+			printlinef(WHITE, GREEN, "Upgrade successful!");
+            len = snprintf(result, max_result_len, OTA_BODY_SUCCESS);
         } else {
-            len = snprintf(result, max_result_len, LED_TEST_BODY, "OFF", 1, "ON");
+			printlinef(WHITE, RED, "Upgrade failed!");
+            len = snprintf(result, max_result_len, OTA_BODY_FAILURE);
         }
     }
     return len;
@@ -241,68 +294,96 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         // Copy the request into the buffer
         pbuf_copy_partial(p, con_state->headers, p->tot_len > sizeof(con_state->headers) - 1 ? sizeof(con_state->headers) - 1 : p->tot_len, 0);
 
-        // Handle GET request
-        if (strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0) {
-			//printlinef(WHITE, BLACK, "GET request.");
-            char *request = con_state->headers + sizeof(HTTP_GET); // + space
-            char *params = strchr(request, '?');
-            if (params) {
-                if (*params) {
-                    char *space = strchr(request, ' ');
-                    *params++ = 0;
-                    if (space) {
-                        *space = 0;
-                    }
-                } else {
-                    params = NULL;
-                }
-            }
+        // Handle GET and POST requests
+		bool isGet = strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0;
+		bool isPost = strncmp(HTTP_POST, con_state->headers, sizeof(HTTP_POST) - 1) == 0;
+        if (isGet || isPost) {
+        	if (strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0) {
+				//printlinef(WHITE, BLACK, "GET request.");
+				char *request = con_state->headers + sizeof(HTTP_GET); // + space
+				char *params = strchr(request, '?');
+				if (params) {
+					if (*params) {
+						char *space = strchr(request, ' ');
+						*params++ = 0;
+						if (space) {
+							*space = 0;
+						}
+					} else {
+						params = NULL;
+					}
+				}
 
-            // Generate content
-            con_state->result_len = test_server_content(request, params, con_state->result, sizeof(con_state->result));
-            DEBUG_printf("Request: %s?%s\n", request, params);
-			//printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
-            DEBUG_printf("Result: %d\n", con_state->result_len);
-			//printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
+				// Generate content
+				con_state->result_len = test_server_content(request, params, con_state->result, sizeof(con_state->result));
+				DEBUG_printf("Request: %s?%s\n", request, params);
+				//printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
+				DEBUG_printf("Result: %d\n", con_state->result_len);
+				//printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
+			} else { // isPost
+				//printlinef(WHITE, BLACK, "POST request.");
+				char *request = con_state->headers + sizeof(HTTP_POST); // + space
+				char *params = strchr(request, '?');	// TODO Get uploaded file in body!
+				if (params) {
+					if (*params) {
+						char *space = strchr(request, ' ');
+						*params++ = 0;
+						if (space) {
+							*space = 0;
+						}
+					} else {
+						params = NULL;
+					}
+				}
 
-            // Check we had enough buffer space
-            if (con_state->result_len > sizeof(con_state->result) - 1) {
-                DEBUG_printf("Too much result data %d\n", con_state->result_len);
-                return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
-            }
+				// TODO pbuf* p contains body ??? Need to handle multiple/follow-up TCP packets?
 
-            // Generate web page
-            if (con_state->result_len > 0) {
-                con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS,
-                    200, con_state->result_len);
-                if (con_state->header_len > sizeof(con_state->headers) - 1) {
-                    DEBUG_printf("Too much header data %d\n", con_state->header_len);
-                    return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
-                }
-            } else {
-                // Send redirect
-                con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_REDIRECT,
-                    ipaddr_ntoa(con_state->gw));
-                DEBUG_printf("Sending redirect %s", con_state->headers);
-            }
+				// Generate content
+				con_state->result_len = test_server_content_upload(request, params, con_state->result, sizeof(con_state->result));
+				DEBUG_printf("Request: %s?%s\n", request, params);
+				//printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
+				DEBUG_printf("Result: %d\n", con_state->result_len);
+				//printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
+			}
 
-            // Send the headers to the client
-            con_state->sent_len = 0;
-            err_t err = tcp_write(pcb, con_state->headers, con_state->header_len, 0);
-            if (err != ERR_OK) {
-                DEBUG_printf("failed to write header data %d\n", err);
-                return tcp_close_client_connection(con_state, pcb, err);
-            }
+			// Check we had enough buffer space
+			if (con_state->result_len > sizeof(con_state->result) - 1) {
+				DEBUG_printf("Too much result data %d\n", con_state->result_len);
+				return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
+			}
 
-            // Send the body to the client
-            if (con_state->result_len) {
-                err = tcp_write(pcb, con_state->result, con_state->result_len, 0);
-                if (err != ERR_OK) {
-                    DEBUG_printf("failed to write result data %d\n", err);
-                    return tcp_close_client_connection(con_state, pcb, err);
-                }
-            }
-        }
+			// Generate web page
+			if (con_state->result_len > 0) {
+				con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS,
+					200, con_state->result_len);
+				if (con_state->header_len > sizeof(con_state->headers) - 1) {
+					DEBUG_printf("Too much header data %d\n", con_state->header_len);
+					return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
+				}
+			} else {
+				// Send redirect
+				con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_REDIRECT,
+					ipaddr_ntoa(con_state->gw));
+				DEBUG_printf("Sending redirect %s", con_state->headers);
+			}
+
+			// Send the headers to the client
+			con_state->sent_len = 0;
+			err_t err = tcp_write(pcb, con_state->headers, con_state->header_len, 0);
+			if (err != ERR_OK) {
+				DEBUG_printf("failed to write header data %d\n", err);
+				return tcp_close_client_connection(con_state, pcb, err);
+			}
+
+			// Send the body to the client
+			if (con_state->result_len) {
+				err = tcp_write(pcb, con_state->result, con_state->result_len, 0);
+				if (err != ERR_OK) {
+					DEBUG_printf("failed to write result data %d\n", err);
+					return tcp_close_client_connection(con_state, pcb, err);
+				}
+			}
+		}
         tcp_recved(pcb, p->tot_len);
     }
     pbuf_free(p);
@@ -330,7 +411,7 @@ static err_t tcp_server_accept(void *arg, struct tcp_pcb *client_pcb, err_t err)
         return ERR_VAL;
     }
     DEBUG_printf("client connected\n");
-	printlinef(WHITE, BLACK, "New TCP client connection.");
+	//printlinef(WHITE, BLACK, "New TCP client connection.");
 
     // Create the state for the connection
     TCP_CONNECT_STATE_T *con_state = calloc(1, sizeof(TCP_CONNECT_STATE_T));
@@ -404,8 +485,6 @@ int main() {
 
 	puttext(204, 20, GREEN, BLACK, "Over-the-Air Firmware Upgrade");
 
-	//printlinef(LABEL_LEFT, 70, WHITE, BLACK, "TODO Waiting for connection and firmware upload...");
-	//printlinef(LABEL_LEFT, 80, WHITE, GREEN, "TODO New client connect with IP address 192.168.64.2");
 	//printlinef(LABEL_LEFT, 90, WHITE, BLACK, "TODO Receiving firmware upload...");
 	//puttextf(LABEL_LEFT, 100, WHITE, BLACK, "TODO Flashing UF2...");
 	//puttextf(LABEL_LEFT, 110, WHITE, GREEN, "TODO Succesfully flashed new firmware...");
@@ -428,9 +507,9 @@ int main() {
     const char *ap_name = "ota";
     const char *password = NULL;
 
-	printlinef(WHITE, BLACK, "Creating Wi-FI access point %s...", ap_name);
+	printlinef(WHITE, BLACK, "Creating Wi-FI access point `%s`...", ap_name);
     cyw43_arch_enable_ap_mode(ap_name, password, CYW43_AUTH_WPA2_AES_PSK);
-	printlinef(WHITE, GREEN, "Access point %s created.", ap_name);
+	printlinef(WHITE, GREEN, "Access point `%s` created.", ap_name);
 
     ip4_addr_t mask;
     IP4_ADDR(ip_2_ip4(&state->gw), 192, 168, 4, 1);
@@ -454,6 +533,7 @@ int main() {
         return 1;
     }
 	printlinef(WHITE, GREEN, "TCP server started.");
+	printlinef(WHITE, BLACK, "Waiting for connection on http://%s%s...", ipaddr_ntoa(&state->gw), OTA_PATH);
 
 	bool blinky = false;
 
