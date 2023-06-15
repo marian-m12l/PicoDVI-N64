@@ -104,8 +104,9 @@ void printlinef(uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
 	puttextf_valist(LABEL_LEFT, line, bgcol, fgcol, fmt, args);
+	puttextf_valist(LABEL_LEFT, line+10, WHITE, WHITE, "                                                                            ", args);
 	line += 10;
-    if (line > 460) {
+    if (line > 450) {
         line = 40;
     }
 	va_end(args);
@@ -134,10 +135,6 @@ void core1_main() {
 }
 
 
-// Firmware is flashed at a 1MB offset (0x100000)
-#define FLASH_TARGET_OFFSET (1024 * 1024)
-const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
-
 void print_buf(const uint8_t *buf, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         printf("%02x", buf[i]);
@@ -146,39 +143,6 @@ void print_buf(const uint8_t *buf, size_t len) {
         else
             printf(" ");
     }
-}
-
-bool program_flash() {
-	// FIXME get data as param
-    uint8_t data[FLASH_PAGE_SIZE];
-    for (int i = 0; i < FLASH_PAGE_SIZE; ++i)
-        data[i] = i % 128;
-
-    printf("Generated data:\n");
-    print_buf(data, FLASH_PAGE_SIZE);
-
-    // Note that a whole number of sectors must be erased at a time.
-    printf("\nErasing target region...\n");
-    flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
-    printf("Done. Read back target region:\n");
-    print_buf(flash_target_contents, FLASH_PAGE_SIZE);
-
-    printf("\nProgramming target region...\n");
-    flash_range_program(FLASH_TARGET_OFFSET, data, FLASH_PAGE_SIZE);
-    printf("Done. Read back target region:\n");
-    print_buf(flash_target_contents, FLASH_PAGE_SIZE);
-
-    bool mismatch = false;
-    for (int i = 0; i < FLASH_PAGE_SIZE; ++i) {
-        if (data[i] != flash_target_contents[i])
-            mismatch = true;
-    }
-    if (mismatch)
-        printf("Programming failed!\n");
-    else
-        printf("Programming successful!\n");
-	
-	return mismatch;
 }
 
 
@@ -260,7 +224,7 @@ void boot_stage2() {
 #define HTTP_GET "GET"
 #define HTTP_POST "POST"
 #define HTTP_RESPONSE_HEADERS "HTTP/1.1 %d OK\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><form method=\"POST\" action=\"%s\"><input type=\"file\" id=\"firmware\" name=\"firmware\" accept=\"uf2\" /><input type=\"submit\" value=\"Upgrade\" /></form><form method=\"POST\" action=\"%s\"><input type=\"submit\" value=\"Boot stage 2\" /></form></body></html>"
+#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><form method=\"POST\" action=\"%s\" enctype=\"multipart/form-data\"><input type=\"file\" id=\"firmware\" name=\"firmware\"/><input type=\"submit\" value=\"Upgrade\" /></form><form method=\"POST\" action=\"%s\"><input type=\"submit\" value=\"Boot stage 2\" /></form></body></html>"
 #define OTA_BODY_SUCCESS "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade successful!</h2></body></html>"
 #define OTA_BODY_FAILURE "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade Failed!</h2></body></html>"
 #define FIRMWARE_PARAM "firmware="
@@ -333,26 +297,63 @@ static int test_server_content(const char *request, const char *params, char *re
     return len;
 }
 
-static int test_server_content_upload(const char *request, const char *params, char *result, size_t max_result_len) {
+static bool fw_recv = false;
+static char fw_remote_ip[16];
+static uint16_t fw_remote_port = 0;
+static uint32_t fw_total_length = 0;
+static uint32_t fw_total_received = 0;
+static uint32_t fw_packets_received = 0;
+static bool fw_flash_ok = true;
+static uint16_t fw_flash_sector = 0;
+static uint16_t fw_buffer_filled = 0;
+static uint8_t fw_buffer[4096];
+
+
+// Firmware is flashed at a 1MB offset (0x100000)
+#define FLASH_TARGET_OFFSET (1024 * 1024)
+const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
+
+
+bool program_flash_sector() {
+    uint32_t offset = FLASH_TARGET_OFFSET + fw_flash_sector*0x1000;
+
+    printlinef(WHITE, RED, "ERASE sector %d @ 0x%08x", fw_flash_sector, offset);
+	flash_range_erase(offset, FLASH_SECTOR_SIZE);
+    
+    printlinef(WHITE, BLACK, "PROGRAM sector %d @ 0x%08x", fw_flash_sector, offset);
+    flash_range_program(offset, fw_buffer, sizeof(fw_buffer));  // TODO only flash up to fw_buffer_filled ??
+
+    bool mismatch = false;
+    const uint8_t *programmed_content = (const uint8_t *) (XIP_BASE + offset);
+    for (int i = 0; i < sizeof(fw_buffer); ++i) {
+        if (fw_buffer[i] != programmed_content[i])
+            mismatch = true;
+    }
+    if (mismatch)
+        printlinef(WHITE, RED, "PROGRAM of sector %d @ 0x%08x FAILED", fw_flash_sector, offset);
+    else
+        printlinef(WHITE, GREEN, "PROGRAM of sector %d @ 0x%08x SUCCEEDED", fw_flash_sector, offset);
+	
+	return mismatch;
+}
+
+
+
+static int test_server_content_upload(struct tcp_pcb *pcb, const char *request, const char *params, char *result, size_t max_result_len) {
     int len = 0;
     if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
 		printlinef(WHITE, BLACK, "Upload POST request.");
-        // See if the user uploaded a firmware
-		// TODO Handle file upload
-		// TODO program flash
-		// TODO read from programmed flash ??
-		bool isUpgradeOk = program_flash() == 0;
+        
+        fw_recv = true;
+        ipaddr_ntoa_r(&pcb->remote_ip, fw_remote_ip, 16);
+        fw_remote_port = pcb->remote_port;
+        fw_total_length = 0;
+        fw_total_received = 0;
+        fw_packets_received = 1;
+        fw_flash_ok = true;
+        fw_flash_sector = 0;
+        fw_buffer_filled = 0;
 
-		printlinef(WHITE, BLACK, "Programmed flash with value: 0x%08x", *((uint32_t*)flash_target_contents));
-
-        // Generate result
-        if (isUpgradeOk) {
-			printlinef(WHITE, GREEN, "Upgrade successful!");
-            len = snprintf(result, max_result_len, OTA_BODY_SUCCESS);
-        } else {
-			printlinef(WHITE, RED, "Upgrade failed!");
-            len = snprintf(result, max_result_len, OTA_BODY_FAILURE);
-        }
     } else if (strncmp(request, BOOT_PATH, sizeof(BOOT_PATH) - 1) == 0) {
         printlinef(WHITE, GREEN, "Booting stage 2...");
         boot_stage2();
@@ -375,15 +376,19 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             DEBUG_printf("in: %.*s\n", q->len, q->payload);
         }
 #endif
-        for (struct pbuf *q = p; q != NULL; q = q->next) {
+        /*for (struct pbuf *q = p; q != NULL; q = q->next) {
             printlinef(WHITE, BLUE, "in: %.*s\n", q->len, q->payload);
-        }
+        }*/
+        //printlinef(WHITE, BLUE, "RECV port=%d", pcb->remote_port);
+        //printlinef(WHITE, BLUE, "RECV addr=%s", ipaddr_ntoa(&pcb->remote_ip));
+        //printlinef(WHITE, BLUE, "RECV from %s:%d", ipaddr_ntoa(&pcb->remote_ip), pcb->remote_port);
         // Copy the request into the buffer
         pbuf_copy_partial(p, con_state->headers, p->tot_len > sizeof(con_state->headers) - 1 ? sizeof(con_state->headers) - 1 : p->tot_len, 0);
 
         // Handle GET and POST requests
 		bool isGet = strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0;
 		bool isPost = strncmp(HTTP_POST, con_state->headers, sizeof(HTTP_POST) - 1) == 0;
+        bool isFirmwareUploadClient = (strncmp(ipaddr_ntoa(&pcb->remote_ip), fw_remote_ip, sizeof(fw_remote_ip) - 1) == 0) && pcb->remote_port == fw_remote_port;
 		bool isFirmware = strncmp(FIRMWARE_PARAM, con_state->headers, sizeof(FIRMWARE_PARAM) - 1) == 0;
         if (isGet) {
             //printlinef(WHITE, BLACK, "GET request.");
@@ -465,8 +470,10 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d", p->len, p->tot_len);
             //printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d next=%x payload=0x%08x", p->len, p->tot_len, p->next, *((uint32_t*)p->payload));
 
+            // FIXME HACK Need to parse Content-Length
+
             // Generate content
-            con_state->result_len = test_server_content_upload(request, params, con_state->result, sizeof(con_state->result));
+            con_state->result_len = test_server_content_upload(pcb, request, params, con_state->result, sizeof(con_state->result));
             DEBUG_printf("Request: %s?%s\n", request, params);
             //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
             DEBUG_printf("Result: %d\n", con_state->result_len);
@@ -477,6 +484,58 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             printlinef(WHITE, BLACK, "FW: len=%d tot_len=%d", p->len, p->tot_len);
             // TODO need to ack the tcp packet to get follow-ups?
             // TODO parse multipart-form-data + parse uf2 + program flash
+        }
+        
+        if (isFirmwareUploadClient) {
+            printlinef(WHITE, RED, "FW CLIENT FOLLOW-UP: len=%d tot_len=%d", p->len, p->tot_len);
+            // FIXME HACK Need to parse boundary
+            if (fw_packets_received > 1) { // FIXME HACK second follow up contains the beginning of uploaded file --> start buffering and flashing
+                // Collect enough packet data to fill 4KB buffer
+                uint16_t available = sizeof(fw_buffer) - fw_buffer_filled;
+                uint16_t read = p->tot_len > available ? available : p->tot_len;
+                uint16_t remaining = p->tot_len - read;
+                pbuf_copy_partial(p, fw_buffer + fw_buffer_filled, read, 0);
+                fw_buffer_filled += read;
+                printlinef(WHITE, BLACK, "filled=%d", fw_buffer_filled);
+                // If buffer is full, erase and program sector
+                if (fw_buffer_filled == sizeof(fw_buffer)) {
+                    printlinef(WHITE, GREEN, "PROGRAM SECTOR %d", fw_flash_sector);
+                    fw_flash_ok = fw_flash_ok && (program_flash_sector() == 0);
+                    fw_flash_sector++;
+                    fw_buffer_filled = 0;
+                }
+                // Collect remaining data in packet
+                if (remaining > 0) {
+                    pbuf_copy_partial(p, fw_buffer + fw_buffer_filled, remaining, read);
+                    fw_buffer_filled += remaining;
+                    printlinef(WHITE, BLACK, "filled=%d", fw_buffer_filled);
+                }
+                // FIXME HACK Last packet ends with boundary --> should be ignored. can be flashed anyway since it's after the firmware ¯\(ツ)/¯
+                fw_total_received += p->tot_len;
+                
+                // FIXME HACK Detect last packet based on received bytes vs expected bytes
+                //if (fw_total_received >= 31956) {
+                if (fw_total_received >= 35204) {
+                // if (fw_total_received == fw_total_length) { // FIXME fw_total_length should be set to Content-Length header value
+                    printlinef(WHITE, RED, "PROGRAM LAST SECTOR %d: len=%d", fw_flash_sector, fw_buffer_filled);
+                    fw_flash_ok = fw_flash_ok && (program_flash_sector() == 0);
+                    fw_flash_sector++;
+                    fw_buffer_filled = 0;
+
+                    // Generate result
+                    // TODO Send HTTP response !
+                    if (fw_flash_ok) {
+                        printlinef(WHITE, GREEN, "Upgrade successful!");
+                        // FIXME len = snprintf(result, max_result_len, OTA_BODY_SUCCESS);
+                    } else {
+                        printlinef(WHITE, RED, "Upgrade failed!");
+                        // FIXME len = snprintf(result, max_result_len, OTA_BODY_FAILURE);
+                    }
+
+                    fw_recv = false;
+                }
+            }
+            fw_packets_received++;
         }
         tcp_recved(pcb, p->tot_len);
     }
@@ -632,6 +691,7 @@ int main() {
 	bool blinky = false;
 
 	while (!state->complete) {
+		fillrect(1, 1, BORDER / 2, BORDER / 2, (blinky = !blinky) ? GREEN : BLACK);
         // if you are using pico_cyw43_arch_poll, then you must poll periodically from your
         // main loop (not from a timer interrupt) to check for Wi-Fi driver or lwIP work that needs to be done.
         cyw43_arch_poll();
