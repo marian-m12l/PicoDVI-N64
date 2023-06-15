@@ -68,7 +68,7 @@ SECTIONS
         /* bit of a hack right now to exclude all floating point and time critical (e.g. memset, memcpy) code from
          * FLASH ... we will include any thing excluded here in .data below by default */
         *(.init)
-        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *main.c.obj *dhcpserver.c.obj *dnsserver.c.obj *dvi*.c.obj *sync.c.obj *tmds*.obj */lwip/*.c.obj *mem_ops*.obj *stdlib.c.obj *stdio.c.obj *printf.c.obj *timer.c.obj *pico_malloc.c.obj) .text*)
+        *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *main.c.obj *dvi*.c.obj *sync.c.obj *tmds*.obj) .text*)
         *(.fini)
         /* Pull all c'tors into .text */
         *crtbegin.o(.ctors)
@@ -125,21 +125,9 @@ SECTIONS
         __ram_text_start__ = .;
         
         *main.c.obj(.text*)
-        *dhcpserver.c.obj(.text*)
-        *dnsserver.c.obj(.text*)
-
         *dvi*.c.obj(.text*)
         *sync.c.obj(.text*)
         *tmds*.obj(.text*)
-
-        */lwip/*.c.obj(.text*)
-        
-        *mem_ops*.obj(.text*)
-        *stdlib.c.obj(.text*)
-        *stdio.c.obj(.text*)
-        *printf.c.obj(.text*)
-        *timer.c.obj(.text*)
-        *pico_malloc.c.obj(.text*)
 
         . = ALIGN(4);
         __ram_text_end__ = .;
