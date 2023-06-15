@@ -22,6 +22,8 @@ target_link_libraries(n64
 # Build pio
 pico_generate_pio_header(n64 ${CMAKE_CURRENT_LIST_DIR}/n64.pio)
 
+# Custom linker script to move stage 2 firmware to 1MB offset in flash
+pico_set_linker_script(n64 ${CMAKE_CURRENT_SOURCE_DIR}/memmap_offset.ld)
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(n64)

@@ -25,6 +25,11 @@
 #include "dhcpserver.h"
 #include "dnsserver.h"
 
+#include "hardware/resets.h"
+#include "hardware/structs/scb.h"
+#include "hardware/structs/nvic.h"
+#include "hardware/structs/systick.h"
+
 
 // DVDD 1.2V (1.1V seems ok too)
 #define FRAME_WIDTH 640
@@ -79,8 +84,8 @@ void puttext(uint x0, uint y0, uint bgcol, uint fgcol, const char *text) {
 }
 
 void puttextf_valist(uint x0, uint y0, uint bgcol, uint fgcol, const char *fmt, va_list args) {
-	char buf[128];
-	vsnprintf(buf, 128, fmt, args);
+	char buf[77];
+	vsnprintf(buf, 77, fmt, args);
 	puttext(x0, y0, bgcol, fgcol, buf);
 }
 
@@ -100,6 +105,9 @@ void printlinef(uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_start(args, fmt);
 	puttextf_valist(LABEL_LEFT, line, bgcol, fgcol, fmt, args);
 	line += 10;
+    if (line > 460) {
+        line = 40;
+    }
 	va_end(args);
 }
 
@@ -174,17 +182,90 @@ bool program_flash() {
 }
 
 
+bool dryrun = false;
+
+void disable_interrupts(void)
+{
+    printlinef(WHITE, BLACK, "disable_interrupts");
+    if (!dryrun) {
+        systick_hw->csr &= ~1;
+
+        nvic_hw->icer = 0xFFFFFFFF;
+        nvic_hw->icpr = 0xFFFFFFFF;
+    }
+}
+
+void reset_peripherals(void)
+{
+    printlinef(WHITE, BLACK, "reset_peripherals");
+    if (!dryrun) {
+        reset_block(~(
+                RESETS_RESET_IO_QSPI_BITS |
+                RESETS_RESET_PADS_QSPI_BITS |
+                RESETS_RESET_SYSCFG_BITS |
+                RESETS_RESET_PLL_SYS_BITS
+        ));
+    }
+}
+
+void jump_to_vtor(uint32_t vtor)
+{
+    printlinef(WHITE, BLACK, "jump_to_vtor: 0x%08x", vtor);
+	uint32_t reset_vector = *(volatile uint32_t *)(vtor + 0x04);
+    printlinef(WHITE, BLACK, "reset_vector=0x%08x", reset_vector);
+    printlinef(WHITE, BLACK, "msb=0x%08x", (*(volatile uint32_t *)vtor));
+    printlinef(WHITE, BLACK, "bx 0x%08x", reset_vector);
+	if (!dryrun) {
+        scb_hw->vtor = (volatile uint32_t)(vtor);
+        asm volatile("msr msp, %0"::"g"
+                (*(volatile uint32_t *)vtor));
+        asm volatile("bx %0"::"r" (reset_vector));
+    }
+}
+
+void boot_stage2() {
+    uint32_t vtor = XIP_BASE + 0x100000 + 0x100;
+
+    // Halt core1
+    printlinef(WHITE, BLACK, "multicore_reset_core1");
+    if (!dryrun) {
+        multicore_reset_core1();
+    }
+    // Reset system clock
+    printlinef(WHITE, BLACK, "set_sys_clock_khz: %d KHz", 125000);
+    if (!dryrun) {
+	    set_sys_clock_khz(125000, true);
+    }
+    // Reset voltage
+    printlinef(WHITE, BLACK, "vreg_set_voltage(1.1V): %d", VREG_VOLTAGE_DEFAULT);
+    if (!dryrun) {
+	    vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+    }
+    // Disable all interrupts
+    disable_interrupts();
+    // Reset peripherals
+    reset_peripherals();
+    // Point to application vector table, set MSP and jump PC to reset handler
+    jump_to_vtor(vtor);
+    if (!dryrun) {
+        __builtin_unreachable();
+    }
+    dryrun = false;
+}
+
+
 #define TCP_PORT 80
 #define DEBUG_printf printf
 #define POLL_TIME_S 5
 #define HTTP_GET "GET"
 #define HTTP_POST "POST"
 #define HTTP_RESPONSE_HEADERS "HTTP/1.1 %d OK\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><form method=\"POST\" action=\"%s\"><input type=\"file\" id=\"firmware\" name=\"firmware\" accept=\"uf2\" /><input type=\"submit\" value=\"Upgrade\" /></form></body></html>"
+#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><form method=\"POST\" action=\"%s\"><input type=\"file\" id=\"firmware\" name=\"firmware\" accept=\"uf2\" /><input type=\"submit\" value=\"Upgrade\" /></form><form method=\"POST\" action=\"%s\"><input type=\"submit\" value=\"Boot stage 2\" /></form></body></html>"
 #define OTA_BODY_SUCCESS "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade successful!</h2></body></html>"
 #define OTA_BODY_FAILURE "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade Failed!</h2></body></html>"
-#define FIRMWARE_PARAM "firmware=%d"
+#define FIRMWARE_PARAM "firmware="
 #define OTA_PATH "/ota"
+#define BOOT_PATH "/boot"
 #define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" OTA_PATH "\n\n"
 
 typedef struct TCP_SERVER_T_ {
@@ -197,7 +278,7 @@ typedef struct TCP_CONNECT_STATE_T_ {
     struct tcp_pcb *pcb;
     int sent_len;
     char headers[128];
-    char result[256];
+    char result[512];
     int header_len;
     int result_len;
     ip_addr_t *gw;
@@ -247,7 +328,7 @@ static int test_server_content(const char *request, const char *params, char *re
     int len = 0;
     if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
         // Generate result
-        len = snprintf(result, max_result_len, OTA_BODY, OTA_PATH);
+        len = snprintf(result, max_result_len, OTA_BODY, OTA_PATH, BOOT_PATH);
     }
     return len;
 }
@@ -272,6 +353,9 @@ static int test_server_content_upload(const char *request, const char *params, c
 			printlinef(WHITE, RED, "Upgrade failed!");
             len = snprintf(result, max_result_len, OTA_BODY_FAILURE);
         }
+    } else if (strncmp(request, BOOT_PATH, sizeof(BOOT_PATH) - 1) == 0) {
+        printlinef(WHITE, GREEN, "Booting stage 2...");
+        boot_stage2();
     }
     return len;
 }
@@ -291,60 +375,38 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             DEBUG_printf("in: %.*s\n", q->len, q->payload);
         }
 #endif
+        for (struct pbuf *q = p; q != NULL; q = q->next) {
+            printlinef(WHITE, BLUE, "in: %.*s\n", q->len, q->payload);
+        }
         // Copy the request into the buffer
         pbuf_copy_partial(p, con_state->headers, p->tot_len > sizeof(con_state->headers) - 1 ? sizeof(con_state->headers) - 1 : p->tot_len, 0);
 
         // Handle GET and POST requests
 		bool isGet = strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0;
 		bool isPost = strncmp(HTTP_POST, con_state->headers, sizeof(HTTP_POST) - 1) == 0;
-        if (isGet || isPost) {
-        	if (strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0) {
-				//printlinef(WHITE, BLACK, "GET request.");
-				char *request = con_state->headers + sizeof(HTTP_GET); // + space
-				char *params = strchr(request, '?');
-				if (params) {
-					if (*params) {
-						char *space = strchr(request, ' ');
-						*params++ = 0;
-						if (space) {
-							*space = 0;
-						}
-					} else {
-						params = NULL;
-					}
-				}
+		bool isFirmware = strncmp(FIRMWARE_PARAM, con_state->headers, sizeof(FIRMWARE_PARAM) - 1) == 0;
+        if (isGet) {
+            //printlinef(WHITE, BLACK, "GET request.");
+            char *request = con_state->headers + sizeof(HTTP_GET); // + space
+            char *params = strchr(request, '?');
+            if (params) {
+                if (*params) {
+                    char *space = strchr(request, ' ');
+                    *params++ = 0;
+                    if (space) {
+                        *space = 0;
+                    }
+                } else {
+                    params = NULL;
+                }
+            }
 
-				// Generate content
-				con_state->result_len = test_server_content(request, params, con_state->result, sizeof(con_state->result));
-				DEBUG_printf("Request: %s?%s\n", request, params);
-				//printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
-				DEBUG_printf("Result: %d\n", con_state->result_len);
-				//printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
-			} else { // isPost
-				//printlinef(WHITE, BLACK, "POST request.");
-				char *request = con_state->headers + sizeof(HTTP_POST); // + space
-				char *params = strchr(request, '?');	// TODO Get uploaded file in body!
-				if (params) {
-					if (*params) {
-						char *space = strchr(request, ' ');
-						*params++ = 0;
-						if (space) {
-							*space = 0;
-						}
-					} else {
-						params = NULL;
-					}
-				}
-
-				// TODO pbuf* p contains body ??? Need to handle multiple/follow-up TCP packets?
-
-				// Generate content
-				con_state->result_len = test_server_content_upload(request, params, con_state->result, sizeof(con_state->result));
-				DEBUG_printf("Request: %s?%s\n", request, params);
-				//printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
-				DEBUG_printf("Result: %d\n", con_state->result_len);
-				//printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
-			}
+            // Generate content
+            con_state->result_len = test_server_content(request, params, con_state->result, sizeof(con_state->result));
+            DEBUG_printf("Request: %s?%s\n", request, params);
+            //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
+            DEBUG_printf("Result: %d\n", con_state->result_len);
+            //printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
 
 			// Check we had enough buffer space
 			if (con_state->result_len > sizeof(con_state->result) - 1) {
@@ -383,7 +445,39 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 					return tcp_close_client_connection(con_state, pcb, err);
 				}
 			}
-		}
+        } else if (isPost) {
+            //printlinef(WHITE, BLACK, "POST request.");
+            char *request = con_state->headers + sizeof(HTTP_POST); // + space
+            char *params = strchr(request, '?');	// TODO Get uploaded file in body!
+            if (params) {
+                if (*params) {
+                    char *space = strchr(request, ' ');
+                    *params++ = 0;
+                    if (space) {
+                        *space = 0;
+                    }
+                } else {
+                    params = NULL;
+                }
+            }
+
+            // TODO pbuf* p contains body ??? Need to handle multiple/follow-up TCP packets?
+            printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d", p->len, p->tot_len);
+            //printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d next=%x payload=0x%08x", p->len, p->tot_len, p->next, *((uint32_t*)p->payload));
+
+            // Generate content
+            con_state->result_len = test_server_content_upload(request, params, con_state->result, sizeof(con_state->result));
+            DEBUG_printf("Request: %s?%s\n", request, params);
+            //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
+            DEBUG_printf("Result: %d\n", con_state->result_len);
+            //printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
+
+            // FIXME DON'T SEND RESPONSE JUST YET --> WAIT FOR FILE UPLOAD !!!
+        } else if (isFirmware) {
+            printlinef(WHITE, BLACK, "FW: len=%d tot_len=%d", p->len, p->tot_len);
+            // TODO need to ack the tcp packet to get follow-ups?
+            // TODO parse multipart-form-data + parse uf2 + program flash
+        }
         tcp_recved(pcb, p->tot_len);
     }
     pbuf_free(p);
