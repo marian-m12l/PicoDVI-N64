@@ -30,6 +30,9 @@
 #include "hardware/structs/nvic.h"
 #include "hardware/structs/systick.h"
 
+#include "pico/binary_info/defs.h"
+#include "pico/binary_info/structure.h"
+
 
 // DVDD 1.2V (1.1V seems ok too)
 #define FRAME_WIDTH 640
@@ -675,7 +678,93 @@ static bool tcp_server_open(void *arg) {
 }
 
 
+
+typedef struct firmware_info_t {
+    bool exists;
+    char* prog_name;
+    char* prog_version;
+    char* prog_date;
+    char* sdk_version;
+    char* pico_board;
+} firmware_info_t;
+
+firmware_info_t fw_info_slot1;
+
+uint32_t* find_binary_info() {
+    for (int i=0x100; i<0x200; i+=4) {
+        uint32_t data = *(uint32_t*)(XIP_BASE + FLASH_TARGET_OFFSET + i);
+	    //printlinef(WHITE, BLACK, "(1) *(0x%p) = 0x%08x", (uint32_t*)(XIP_BASE + FLASH_TARGET_OFFSET + i), data);
+        if (data == BINARY_INFO_MARKER_START) {
+            data = *(uint32_t*)(XIP_BASE + FLASH_TARGET_OFFSET + i + 16);
+	        //printlinef(WHITE, BLACK, "(2) *(0x%p) = 0x%08x", (uint32_t*)(XIP_BASE + FLASH_TARGET_OFFSET + i + 16), data);
+            if (data == BINARY_INFO_MARKER_END) {
+                return (uint32_t*)(XIP_BASE + FLASH_TARGET_OFFSET + i);
+            }
+        }
+    }
+    return (uint32_t*) 0;
+}
+
+void get_firmware_info() {
+    uint32_t* binary_info = find_binary_info();
+	//printlinef(WHITE, BLACK, "binary_info: %p", binary_info);
+    if (binary_info != 0) {
+        // Stage 2 firmware exists
+        fw_info_slot1.exists = true;
+        uint32_t* binary_info_start = (uint32_t*)(binary_info[1]);
+        uint32_t* binary_info_end = (uint32_t*)(binary_info[2]);
+	    //printlinef(WHITE, BLACK, "binary_info_start: %p", binary_info_start);
+	    //printlinef(WHITE, BLACK, "binary_info_end: %p", binary_info_end);
+        for (uint32_t* i=binary_info_start; i<binary_info_end; i++) {
+	        //printlinef(WHITE, BLACK, "entry @ %p --> 0x%08x", i, *i);
+            uint16_t* entry16 = (uint16_t*) *i;
+            uint32_t* entry32 = (uint32_t*) *i;
+            uint16_t type = entry16[0];
+	        //printlinef(WHITE, BLACK, "entry type: 0x%04x", type);
+            uint16_t tag = entry16[1];
+	        //printlinef(WHITE, BLACK, "entry tag: 0x%04x", tag);
+            uint32_t id = entry32[1];
+	        //printlinef(WHITE, BLACK, "entry id: 0x%08x", id);
+            uint32_t value_addr = entry32[2];
+	        //printlinef(WHITE, BLACK, "entry value address: 0x%08x", value_addr);
+
+            switch(id) {
+                case BINARY_INFO_ID_RP_PROGRAM_NAME:
+                    //printlinef(WHITE, BLACK, "  PROGRAM NAME: %s", (char*)value_addr);
+                    fw_info_slot1.prog_name = (char*)value_addr;
+                    break;
+                case BINARY_INFO_ID_RP_PROGRAM_VERSION_STRING:
+                    //printlinef(WHITE, BLACK, "  PROGRAM VERSION: %s", (char*)value_addr);
+                    fw_info_slot1.prog_version = (char*)value_addr;
+                    break;
+                case BINARY_INFO_ID_RP_PROGRAM_BUILD_DATE_STRING:
+                    //printlinef(WHITE, BLACK, "  PROGRAM BUILD DATE: %s", (char*)value_addr);
+                    fw_info_slot1.prog_date = (char*)value_addr;
+                    break;
+                case BINARY_INFO_ID_RP_SDK_VERSION:
+                    //printlinef(WHITE, BLACK, "  SDK VERSION: %s", (char*)value_addr);
+                    fw_info_slot1.sdk_version = (char*)value_addr;
+                    break;
+                case BINARY_INFO_ID_RP_PICO_BOARD:
+                    //printlinef(WHITE, BLACK, "  PICO BOARD: %s", (char*)value_addr);
+                    fw_info_slot1.pico_board = (char*)value_addr;
+                    break;
+            }
+        }
+    }
+}
+
+
 int main() {
+    // TODO Check for forced upgrade (joybus buttons combination or magic value)
+    
+    // Check if there is a stage2 firmware. Boot if available
+    get_firmware_info();
+
+    /*if (fw_info_slot1.exists) {
+        boot_stage2();
+    }*/
+
 	vreg_set_voltage(VREG_VSEL);
 	sleep_ms(10);
 	set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
@@ -696,14 +785,27 @@ int main() {
 
 	puttext(204, 20, GREEN, BLACK, "Over-the-Air Firmware Upgrade");
 
-	//printlinef(LABEL_LEFT, 90, WHITE, BLACK, "TODO Receiving firmware upload...");
-	//puttextf(LABEL_LEFT, 100, WHITE, BLACK, "TODO Flashing UF2...");
-	//puttextf(LABEL_LEFT, 110, WHITE, GREEN, "TODO Succesfully flashed new firmware...");
-	//puttextf(LABEL_LEFT, 120, WHITE, BLACK, "TODO Booting stage 2 firmware...");
-
 	multicore_launch_core1(core1_main);
 
 
+    if (fw_info_slot1.exists) {
+        printlinef(WHITE, BLACK, "Firmware is installed:");
+        if (fw_info_slot1.prog_name != 0) {
+            printlinef(WHITE, BLACK, "  PROGRAM NAME: %s", fw_info_slot1.prog_name);
+        }
+        if (fw_info_slot1.prog_version != 0) {
+            printlinef(WHITE, BLACK, "  PROGRAM VERSION: %s", fw_info_slot1.prog_version);
+        }
+        if (fw_info_slot1.prog_date != 0) {
+            printlinef(WHITE, BLACK, "  PROGRAM DATE: %s", fw_info_slot1.prog_date);
+        }
+        if (fw_info_slot1.sdk_version != 0) {
+            printlinef(WHITE, BLACK, "  SDK VERSION: %s", fw_info_slot1.sdk_version);
+        }
+        if (fw_info_slot1.pico_board != 0) {
+            printlinef(WHITE, BLACK, "  PICO BOARD: %s", fw_info_slot1.pico_board);
+        }
+    }
 
     TCP_SERVER_T *state = calloc(1, sizeof(TCP_SERVER_T));
     if (!state) {
