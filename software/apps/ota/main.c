@@ -97,18 +97,39 @@ void puttextf(uint x0, uint y0, uint bgcol, uint fgcol, const char *fmt, ...) {
 }
 
 
+const uint FIRST_LINE = 40;
+const uint LAST_LINE = 430;
+const uint FOOTER_LINE = 450;
 const uint LABEL_LEFT = 18;
-uint16_t line = 40;
+uint16_t line = FIRST_LINE;
+
+void ffw() {
+    line += 10;
+    if (line > LAST_LINE) {
+        line = FIRST_LINE;
+    }
+}
+
+void rwd() {
+    line -= 10;
+    if (line < FIRST_LINE) {
+        line = LAST_LINE;
+    }
+}
 
 void printlinef(uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
 	puttextf_valist(LABEL_LEFT, line, bgcol, fgcol, fmt, args);
 	puttextf_valist(LABEL_LEFT, line+10, WHITE, WHITE, "                                                                            ", args);
-	line += 10;
-    if (line > 450) {
-        line = 40;
-    }
+	ffw();
+	va_end(args);
+}
+
+void printfooterf(uint bgcol, uint fgcol, const char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	puttextf_valist(LABEL_LEFT, FOOTER_LINE, bgcol, fgcol, fmt, args);
 	va_end(args);
 }
 
@@ -209,6 +230,12 @@ void boot_stage2() {
     disable_interrupts();
     // Reset peripherals
     reset_peripherals();
+    // TODO Replace crt0.S
+    //  --> copy .data from FLASH to RAM (__data_start__ to __data_end__ ==> __etext)
+    //  --> copy .scratch_x from FLASH to RAM (__scratch_x_start__ to __scratch_x_end__ ==> __scratch_x_source__)
+    //  --> copy .scratch_y from FLASH to RAM (__scratch_y_start__ to __scratch_y_end__ ==> __scratch_y_source__)
+    //  --> clear .bss (__bss_start__ to __bss_end__ = 0)
+    // TODO Jump directly to entry_point
     // Point to application vector table, set MSP and jump PC to reset handler
     jump_to_vtor(vtor);
     if (!dryrun) {
@@ -301,12 +328,18 @@ static bool fw_recv = false;
 static char fw_remote_ip[16];
 static uint16_t fw_remote_port = 0;
 static uint32_t fw_total_length = 0;
+static uint16_t fw_total_sectors = 0;
 static uint32_t fw_total_received = 0;
 static uint32_t fw_packets_received = 0;
 static bool fw_flash_ok = true;
 static uint16_t fw_flash_sector = 0;
 static uint16_t fw_buffer_filled = 0;
 static uint8_t fw_buffer[4096];
+
+#define CRLF "\r\n"
+#define HTTP_HDR_CONTENT_LEN                "Content-Length: "
+#define HTTP_HDR_CONTENT_LEN_LEN            16
+#define HTTP_HDR_CONTENT_LEN_DIGIT_MAX_LEN  10
 
 
 // Firmware is flashed at a 1MB offset (0x100000)
@@ -337,29 +370,17 @@ bool program_flash_sector() {
 	return mismatch;
 }
 
-
-
-static int test_server_content_upload(struct tcp_pcb *pcb, const char *request, const char *params, char *result, size_t max_result_len) {
-    int len = 0;
-    if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
-		printlinef(WHITE, BLACK, "Upload POST request.");
-        
-        fw_recv = true;
-        ipaddr_ntoa_r(&pcb->remote_ip, fw_remote_ip, 16);
-        fw_remote_port = pcb->remote_port;
-        fw_total_length = 0;
-        fw_total_received = 0;
-        fw_packets_received = 1;
-        fw_flash_ok = true;
-        fw_flash_sector = 0;
-        fw_buffer_filled = 0;
-
-    } else if (strncmp(request, BOOT_PATH, sizeof(BOOT_PATH) - 1) == 0) {
-        printlinef(WHITE, GREEN, "Booting stage 2...");
-        boot_stage2();
-    }
-    return len;
+void print_progress(bool flashing, uint8_t flashed, uint8_t total) {
+    /*printfooterf(WHITE, BLACK,
+        "PROGRAMMING [%.*s%s%.*s]",
+        flashed, "============================================================",
+        flashing ? ">" : "",
+        total - flashed - (flashing ? 1 : 0), "------------------------------------------------------------");*/
+    printfooterf(WHITE, BLACK, "PROGRAMMING [ %3d / %3d ]", flashed, total);
 }
+
+
+
 
 err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     TCP_CONNECT_STATE_T *con_state = (TCP_CONNECT_STATE_T*)arg;
@@ -453,33 +474,66 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         } else if (isPost) {
             //printlinef(WHITE, BLACK, "POST request.");
             char *request = con_state->headers + sizeof(HTTP_POST); // + space
-            char *params = strchr(request, '?');	// TODO Get uploaded file in body!
-            if (params) {
-                if (*params) {
-                    char *space = strchr(request, ' ');
-                    *params++ = 0;
-                    if (space) {
-                        *space = 0;
+            //printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d", p->len, p->tot_len);
+
+            if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
+                printlinef(WHITE, BLACK, "Upload POST request.");
+
+                // Parse Content-Length
+                int content_len;
+                char* find_in = p->payload;
+                char* crlfcrlf = strnstr(find_in, CRLF CRLF, p->len);
+                if (crlfcrlf != NULL) {
+                    char *scontent_len = strnstr(find_in, HTTP_HDR_CONTENT_LEN, crlfcrlf - find_in);
+                    if (scontent_len != NULL) {
+                        char *scontent_len_end = strnstr(scontent_len + HTTP_HDR_CONTENT_LEN_LEN, CRLF, HTTP_HDR_CONTENT_LEN_DIGIT_MAX_LEN);
+                        if (scontent_len_end != NULL) {
+                            char *content_len_num = scontent_len + HTTP_HDR_CONTENT_LEN_LEN;
+                            content_len = atoi(content_len_num);
+                            if (content_len == 0) {
+                                /* if atoi returns 0 on error, fix this */
+                                if ((content_len_num[0] != '0') || (content_len_num[1] != '\r')) {
+                                    content_len = -1;
+                                }
+                            }
+                        }
                     }
-                } else {
-                    params = NULL;
                 }
+                if (content_len <= 0) {
+                    printlinef(WHITE, RED, "Could not parse Content-Length header.");
+                    // TODO Return HTTP Error 400 Bad Request
+                } else {
+                    printlinef(WHITE, BLACK, "Content-Length=%d", content_len);
+
+                    // TODO Body maybe begin right after crlfcrlf in this first tcp pbuf ???
+
+                    // Generate content
+                    fw_recv = true;
+                    ipaddr_ntoa_r(&pcb->remote_ip, fw_remote_ip, 16);
+                    fw_remote_port = pcb->remote_port;
+                    fw_total_received = 0;
+                    fw_packets_received = 1;
+                    fw_flash_ok = true;
+                    fw_flash_sector = 0;
+                    fw_buffer_filled = 0;
+                    fw_total_length = content_len;
+                    fw_total_sectors = 1 + ((content_len - 1) / FLASH_SECTOR_SIZE);
+                    printlinef(WHITE, BLACK, "fw_total_length=%d fw_total_sectors=%d", fw_total_length, fw_total_sectors);
+
+                    print_progress(false, 0, fw_total_sectors);
+
+                    //DEBUG_printf("Request: %s?%s\n", request, params);
+                    //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
+                    //DEBUG_printf("Result: %d\n", con_state->result_len);
+                    //printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
+
+                    // FIXME DON'T SEND RESPONSE JUST YET --> WAIT FOR FILE UPLOAD !!!
+                }
+
+            } else if (strncmp(request, BOOT_PATH, sizeof(BOOT_PATH) - 1) == 0) {
+                printlinef(WHITE, GREEN, "Booting stage 2...");
+                boot_stage2();
             }
-
-            // TODO pbuf* p contains body ??? Need to handle multiple/follow-up TCP packets?
-            printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d", p->len, p->tot_len);
-            //printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d next=%x payload=0x%08x", p->len, p->tot_len, p->next, *((uint32_t*)p->payload));
-
-            // FIXME HACK Need to parse Content-Length
-
-            // Generate content
-            con_state->result_len = test_server_content_upload(pcb, request, params, con_state->result, sizeof(con_state->result));
-            DEBUG_printf("Request: %s?%s\n", request, params);
-            //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
-            DEBUG_printf("Result: %d\n", con_state->result_len);
-            //printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
-
-            // FIXME DON'T SEND RESPONSE JUST YET --> WAIT FOR FILE UPLOAD !!!
         } else if (isFirmware) {
             printlinef(WHITE, BLACK, "FW: len=%d tot_len=%d", p->len, p->tot_len);
             // TODO need to ack the tcp packet to get follow-ups?
@@ -487,40 +541,45 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         }
         
         if (isFirmwareUploadClient) {
-            printlinef(WHITE, RED, "FW CLIENT FOLLOW-UP: len=%d tot_len=%d", p->len, p->tot_len);
+            //printlinef(WHITE, RED, "FW CLIENT FOLLOW-UP: len=%d tot_len=%d", p->len, p->tot_len);
             // FIXME HACK Need to parse boundary
-            if (fw_packets_received > 1) { // FIXME HACK second follow up contains the beginning of uploaded file --> start buffering and flashing
+            // TODO First body packet --> parse boundary (AND SKIP)
+            fw_packets_received++;
+            fw_total_received += p->tot_len;
+            //printlinef(WHITE, RED, "RECVd: %d / %d", fw_total_received, fw_total_length);
+            if (fw_packets_received > 2) { // FIXME HACK second follow up contains the beginning of uploaded file --> start buffering and flashing
                 // Collect enough packet data to fill 4KB buffer
                 uint16_t available = sizeof(fw_buffer) - fw_buffer_filled;
                 uint16_t read = p->tot_len > available ? available : p->tot_len;
                 uint16_t remaining = p->tot_len - read;
                 pbuf_copy_partial(p, fw_buffer + fw_buffer_filled, read, 0);
                 fw_buffer_filled += read;
-                printlinef(WHITE, BLACK, "filled=%d", fw_buffer_filled);
+                //printlinef(WHITE, BLACK, "filled=%d", fw_buffer_filled);
                 // If buffer is full, erase and program sector
                 if (fw_buffer_filled == sizeof(fw_buffer)) {
-                    printlinef(WHITE, GREEN, "PROGRAM SECTOR %d", fw_flash_sector);
+                    //printlinef(WHITE, GREEN, "PROGRAM SECTOR %d", fw_flash_sector);
+                    print_progress(true, fw_flash_sector, fw_total_sectors);
                     fw_flash_ok = fw_flash_ok && (program_flash_sector() == 0);
                     fw_flash_sector++;
                     fw_buffer_filled = 0;
+                    print_progress(true, fw_flash_sector, fw_total_sectors);
                 }
                 // Collect remaining data in packet
                 if (remaining > 0) {
                     pbuf_copy_partial(p, fw_buffer + fw_buffer_filled, remaining, read);
                     fw_buffer_filled += remaining;
-                    printlinef(WHITE, BLACK, "filled=%d", fw_buffer_filled);
+                    //printlinef(WHITE, BLACK, "filled=%d", fw_buffer_filled);
                 }
-                // FIXME HACK Last packet ends with boundary --> should be ignored. can be flashed anyway since it's after the firmware ¯\(ツ)/¯
-                fw_total_received += p->tot_len;
                 
+                // FIXME HACK Last packet ends with boundary --> should be ignored. can be flashed anyway since it's after the firmware ¯\(ツ)/¯
                 // FIXME HACK Detect last packet based on received bytes vs expected bytes
-                //if (fw_total_received >= 31956) {
-                if (fw_total_received >= 35204) {
-                // if (fw_total_received == fw_total_length) { // FIXME fw_total_length should be set to Content-Length header value
-                    printlinef(WHITE, RED, "PROGRAM LAST SECTOR %d: len=%d", fw_flash_sector, fw_buffer_filled);
+                if (fw_total_received >= fw_total_length) {
+                    //printlinef(WHITE, RED, "PROGRAM LAST SECTOR %d: len=%d", fw_flash_sector, fw_buffer_filled);
+                    print_progress(true, fw_flash_sector, fw_total_sectors);
                     fw_flash_ok = fw_flash_ok && (program_flash_sector() == 0);
                     fw_flash_sector++;
                     fw_buffer_filled = 0;
+                    print_progress(false, fw_flash_sector, fw_total_sectors);
 
                     // Generate result
                     // TODO Send HTTP response !
@@ -535,7 +594,6 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                     fw_recv = false;
                 }
             }
-            fw_packets_received++;
         }
         tcp_recved(pcb, p->tot_len);
     }
