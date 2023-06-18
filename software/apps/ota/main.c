@@ -34,6 +34,10 @@
 #include "pico/binary_info/structure.h"
 
 
+/*************************************/
+/**********       DVI       **********/
+/*************************************/
+
 // DVDD 1.2V (1.1V seems ok too)
 #define FRAME_WIDTH 640
 #define FRAME_HEIGHT 480
@@ -49,11 +53,112 @@
 #define WHITE 0x7
 uint8_t framebuf[3 * PLANE_SIZE_BYTES];
 
+struct dvi_inst dvi0;
+
+
+/*************************************/
+/**********    TERMINAL     **********/
+/*************************************/
+
 #include "font_8x8.h"
 #define FONT_CHAR_WIDTH 8
 #define FONT_CHAR_HEIGHT 8
 #define FONT_N_CHARS 95
 #define FONT_FIRST_ASCII 32
+
+const uint FIRST_LINE = 40;
+const uint LAST_LINE = 430;
+const uint FOOTER_LINE = 450;
+const uint LABEL_LEFT = 18;
+uint16_t line = FIRST_LINE;
+
+
+/*************************************/
+/**********   TCP / HTTP    **********/
+/*************************************/
+
+#define TCP_PORT 80
+#define DEBUG_printf printf
+#define POLL_TIME_S 5
+#define HTTP_GET "GET"
+#define HTTP_POST "POST"
+#define OTA_PATH "/ota"
+#define BOOT_PATH "/boot"
+#define HTTP_RESPONSE_HEADERS "HTTP/1.1 %s\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
+#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><p>Installed: %s</p><p>Build date: %s</p><form method=\"POST\" action=\"%s\" enctype=\"multipart/form-data\"><input type=\"file\" id=\"firmware\" name=\"firmware\"/><input type=\"submit\" value=\"Upgrade\" /></form><form method=\"POST\" action=\"%s\"><input type=\"submit\" value=\"Boot stage 2\" /></form></body></html>"
+#define OTA_BODY_SUCCESS "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade successful!</h2><p><a href=\"" OTA_PATH "\">Back</a></p></body></html>"
+#define OTA_BODY_FAILURE "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade Failed!</h2><p><a href=\"" OTA_PATH "\">Back</a></p></body></html>"
+#define HTTP_400 "<html><body>Bad Request</body></html>"
+#define HTTP_404 "<html><body>Not Found</body></html>"
+#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" OTA_PATH "\n\n"
+
+typedef struct TCP_SERVER_T_ {
+    struct tcp_pcb *server_pcb;
+    bool complete;
+    ip_addr_t gw;
+} TCP_SERVER_T;
+
+typedef struct TCP_CONNECT_STATE_T_ {
+    struct tcp_pcb *pcb;
+    int sent_len;
+    char headers[128];
+    char result[512];
+    int header_len;
+    int result_len;
+    ip_addr_t *gw;
+} TCP_CONNECT_STATE_T;
+
+TCP_SERVER_T *state;
+dhcp_server_t dhcp_server;
+dns_server_t dns_server;
+
+
+/*************************************/
+/********** UPLOAD / FLASH  **********/
+/*************************************/
+
+static bool fw_recv = false;
+static char fw_remote_ip[16];
+static uint16_t fw_remote_port = 0;
+static uint32_t fw_total_length = 0;
+static uint16_t fw_total_sectors = 0;
+static uint32_t fw_total_received = 0;
+static uint32_t fw_packets_received = 0;
+static bool fw_flash_ok = true;
+static uint16_t fw_flash_sector = 0;
+static uint16_t fw_buffer_filled = 0;
+static uint8_t fw_buffer[4096];
+
+#define CRLF "\r\n"
+#define HTTP_HDR_CONTENT_LEN                "Content-Length: "
+#define HTTP_HDR_CONTENT_LEN_LEN            16
+#define HTTP_HDR_CONTENT_LEN_DIGIT_MAX_LEN  10
+
+// Firmware is flashed at a 1MB offset (0x100000)
+#define FLASH_TARGET_OFFSET (1024 * 1024)
+const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
+
+
+/*************************************/
+/**********   BINARY INFO   **********/
+/*************************************/
+
+typedef struct firmware_info_t {
+    bool exists;
+    char* prog_name;
+    char* prog_version;
+    char* prog_date;
+    char* sdk_version;
+    char* pico_board;
+} firmware_info_t;
+
+firmware_info_t fw_info_slot1;
+
+
+
+/*************************************/
+/**********    TERMINAL     **********/
+/*************************************/
 
 static inline void putpixel(uint x, uint y, uint rgb) {
 	uint8_t mask = 1u << (x % 8);
@@ -99,13 +204,6 @@ void puttextf(uint x0, uint y0, uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_end(args);
 }
 
-
-const uint FIRST_LINE = 40;
-const uint LAST_LINE = 430;
-const uint FOOTER_LINE = 450;
-const uint LABEL_LEFT = 18;
-uint16_t line = FIRST_LINE;
-
 void ffw() {
     line += 10;
     if (line > LAST_LINE) {
@@ -136,8 +234,20 @@ void printfooterf(uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_end(args);
 }
 
+void print_progress(bool flashing, uint8_t flashed, uint8_t total) {
+    /*printfooterf(WHITE, BLACK,
+        "PROGRAMMING [%.*s%s%.*s]",
+        flashed, "============================================================",
+        flashing ? ">" : "",
+        total - flashed - (flashing ? 1 : 0), "------------------------------------------------------------");*/
+    printfooterf(WHITE, BLACK, "PROGRAMMING [ %3d / %3d ]", flashed, total);
+}
 
-struct dvi_inst dvi0;
+
+
+/*************************************/
+/**********       DVI       **********/
+/*************************************/
 
 void core1_main() {
 	dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
@@ -159,124 +269,39 @@ void core1_main() {
 }
 
 
-void print_buf(const uint8_t *buf, size_t len) {
-    for (size_t i = 0; i < len; ++i) {
-        printf("%02x", buf[i]);
-        if (i % 16 == 15)
-            printf("\n");
-        else
-            printf(" ");
+
+/*************************************/
+/********** UPLOAD / FLASH  **********/
+/*************************************/
+
+bool program_flash_sector() {
+    uint32_t offset = FLASH_TARGET_OFFSET + fw_flash_sector*0x1000;
+
+    printlinef(WHITE, RED, "ERASE sector %d @ 0x%08x", fw_flash_sector, offset);
+	flash_range_erase(offset, FLASH_SECTOR_SIZE);
+    
+    printlinef(WHITE, BLACK, "PROGRAM sector %d @ 0x%08x", fw_flash_sector, offset);
+    flash_range_program(offset, fw_buffer, sizeof(fw_buffer));  // TODO only flash up to fw_buffer_filled ??
+
+    bool mismatch = false;
+    const uint8_t *programmed_content = (const uint8_t *) (XIP_BASE + offset);
+    for (int i = 0; i < sizeof(fw_buffer); ++i) {
+        if (fw_buffer[i] != programmed_content[i])
+            mismatch = true;
     }
+    if (mismatch)
+        printlinef(WHITE, RED, "PROGRAM of sector %d @ 0x%08x FAILED", fw_flash_sector, offset);
+    else
+        printlinef(WHITE, GREEN, "PROGRAM of sector %d @ 0x%08x SUCCEEDED", fw_flash_sector, offset);
+	
+	return mismatch;
 }
 
 
-bool dryrun = false;
 
-void disable_interrupts(void)
-{
-    printlinef(WHITE, BLACK, "disable_interrupts");
-    if (!dryrun) {
-        systick_hw->csr &= ~1;
-
-        nvic_hw->icer = 0xFFFFFFFF;
-        nvic_hw->icpr = 0xFFFFFFFF;
-    }
-}
-
-void reset_peripherals(void)
-{
-    printlinef(WHITE, BLACK, "reset_peripherals");
-    if (!dryrun) {
-        reset_block(~(
-                RESETS_RESET_IO_QSPI_BITS |
-                RESETS_RESET_PADS_QSPI_BITS |
-                RESETS_RESET_SYSCFG_BITS |
-                RESETS_RESET_PLL_SYS_BITS
-        ));
-    }
-}
-
-void jump_to_vtor(uint32_t vtor)
-{
-    printlinef(WHITE, BLACK, "jump_to_vtor: 0x%08x", vtor);
-	uint32_t reset_vector = *(volatile uint32_t *)(vtor + 0x04);
-    printlinef(WHITE, BLACK, "reset_vector=0x%08x", reset_vector);
-    printlinef(WHITE, BLACK, "msb=0x%08x", (*(volatile uint32_t *)vtor));
-    printlinef(WHITE, BLACK, "bx 0x%08x", reset_vector);
-	if (!dryrun) {
-        scb_hw->vtor = (volatile uint32_t)(vtor);
-        asm volatile("msr msp, %0"::"g"
-                (*(volatile uint32_t *)vtor));
-        asm volatile("bx %0"::"r" (reset_vector));
-    }
-}
-
-void boot_stage2() {
-    uint32_t vtor = XIP_BASE + 0x100000 + 0x100;
-
-    // Halt core1
-    printlinef(WHITE, BLACK, "multicore_reset_core1");
-    if (!dryrun) {
-        multicore_reset_core1();
-    }
-    // Reset system clock
-    printlinef(WHITE, BLACK, "set_sys_clock_khz: %d KHz", 125000);
-    if (!dryrun) {
-	    set_sys_clock_khz(125000, true);
-    }
-    // Reset voltage
-    printlinef(WHITE, BLACK, "vreg_set_voltage(1.1V): %d", VREG_VOLTAGE_DEFAULT);
-    if (!dryrun) {
-	    vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
-    }
-    // Disable all interrupts
-    disable_interrupts();
-    // Reset peripherals
-    reset_peripherals();
-    // TODO Replace crt0.S
-    //  --> copy .data from FLASH to RAM (__data_start__ to __data_end__ ==> __etext)
-    //  --> copy .scratch_x from FLASH to RAM (__scratch_x_start__ to __scratch_x_end__ ==> __scratch_x_source__)
-    //  --> copy .scratch_y from FLASH to RAM (__scratch_y_start__ to __scratch_y_end__ ==> __scratch_y_source__)
-    //  --> clear .bss (__bss_start__ to __bss_end__ = 0)
-    // TODO Jump directly to entry_point
-    // Point to application vector table, set MSP and jump PC to reset handler
-    jump_to_vtor(vtor);
-    if (!dryrun) {
-        __builtin_unreachable();
-    }
-    dryrun = false;
-}
-
-
-#define TCP_PORT 80
-#define DEBUG_printf printf
-#define POLL_TIME_S 5
-#define HTTP_GET "GET"
-#define HTTP_POST "POST"
-#define HTTP_RESPONSE_HEADERS "HTTP/1.1 %d OK\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><form method=\"POST\" action=\"%s\" enctype=\"multipart/form-data\"><input type=\"file\" id=\"firmware\" name=\"firmware\"/><input type=\"submit\" value=\"Upgrade\" /></form><form method=\"POST\" action=\"%s\"><input type=\"submit\" value=\"Boot stage 2\" /></form></body></html>"
-#define OTA_BODY_SUCCESS "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade successful!</h2></body></html>"
-#define OTA_BODY_FAILURE "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade Failed!</h2></body></html>"
-#define FIRMWARE_PARAM "firmware="
-#define OTA_PATH "/ota"
-#define BOOT_PATH "/boot"
-#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" OTA_PATH "\n\n"
-
-typedef struct TCP_SERVER_T_ {
-    struct tcp_pcb *server_pcb;
-    bool complete;
-    ip_addr_t gw;
-} TCP_SERVER_T;
-
-typedef struct TCP_CONNECT_STATE_T_ {
-    struct tcp_pcb *pcb;
-    int sent_len;
-    char headers[128];
-    char result[512];
-    int header_len;
-    int result_len;
-    ip_addr_t *gw;
-} TCP_CONNECT_STATE_T;
+/*************************************/
+/**********   TCP / HTTP    **********/
+/*************************************/
 
 static err_t tcp_close_client_connection(TCP_CONNECT_STATE_T *con_state, struct tcp_pcb *client_pcb, err_t close_err) {
     if (client_pcb) {
@@ -318,72 +343,34 @@ static err_t tcp_server_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
     return ERR_OK;
 }
 
-static int test_server_content(const char *request, const char *params, char *result, size_t max_result_len) {
-    int len = 0;
-    if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
-        // Generate result
-        len = snprintf(result, max_result_len, OTA_BODY, OTA_PATH, BOOT_PATH);
+void send_response(TCP_CONNECT_STATE_T* con_state, struct tcp_pcb* pcb) {
+    // Check we had enough buffer space
+    if (con_state->result_len > sizeof(con_state->result) - 1) {
+        DEBUG_printf("Too much result data %d\n", con_state->result_len);
+        return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
     }
-    return len;
-}
-
-static bool fw_recv = false;
-static char fw_remote_ip[16];
-static uint16_t fw_remote_port = 0;
-static uint32_t fw_total_length = 0;
-static uint16_t fw_total_sectors = 0;
-static uint32_t fw_total_received = 0;
-static uint32_t fw_packets_received = 0;
-static bool fw_flash_ok = true;
-static uint16_t fw_flash_sector = 0;
-static uint16_t fw_buffer_filled = 0;
-static uint8_t fw_buffer[4096];
-
-#define CRLF "\r\n"
-#define HTTP_HDR_CONTENT_LEN                "Content-Length: "
-#define HTTP_HDR_CONTENT_LEN_LEN            16
-#define HTTP_HDR_CONTENT_LEN_DIGIT_MAX_LEN  10
-
-
-// Firmware is flashed at a 1MB offset (0x100000)
-#define FLASH_TARGET_OFFSET (1024 * 1024)
-const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
-
-
-bool program_flash_sector() {
-    uint32_t offset = FLASH_TARGET_OFFSET + fw_flash_sector*0x1000;
-
-    printlinef(WHITE, RED, "ERASE sector %d @ 0x%08x", fw_flash_sector, offset);
-	flash_range_erase(offset, FLASH_SECTOR_SIZE);
-    
-    printlinef(WHITE, BLACK, "PROGRAM sector %d @ 0x%08x", fw_flash_sector, offset);
-    flash_range_program(offset, fw_buffer, sizeof(fw_buffer));  // TODO only flash up to fw_buffer_filled ??
-
-    bool mismatch = false;
-    const uint8_t *programmed_content = (const uint8_t *) (XIP_BASE + offset);
-    for (int i = 0; i < sizeof(fw_buffer); ++i) {
-        if (fw_buffer[i] != programmed_content[i])
-            mismatch = true;
+    if (con_state->header_len > sizeof(con_state->headers) - 1) {
+        DEBUG_printf("Too much header data %d\n", con_state->header_len);
+        return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
     }
-    if (mismatch)
-        printlinef(WHITE, RED, "PROGRAM of sector %d @ 0x%08x FAILED", fw_flash_sector, offset);
-    else
-        printlinef(WHITE, GREEN, "PROGRAM of sector %d @ 0x%08x SUCCEEDED", fw_flash_sector, offset);
-	
-	return mismatch;
+
+    // Send the headers to the client
+    con_state->sent_len = 0;
+    err_t err = tcp_write(pcb, con_state->headers, con_state->header_len, 0);
+    if (err != ERR_OK) {
+        DEBUG_printf("failed to write header data %d\n", err);
+        return tcp_close_client_connection(con_state, pcb, err);
+    }
+
+    // Send the body to the client
+    if (con_state->result_len) {
+        err = tcp_write(pcb, con_state->result, con_state->result_len, 0);
+        if (err != ERR_OK) {
+            DEBUG_printf("failed to write result data %d\n", err);
+            return tcp_close_client_connection(con_state, pcb, err);
+        }
+    }
 }
-
-void print_progress(bool flashing, uint8_t flashed, uint8_t total) {
-    /*printfooterf(WHITE, BLACK,
-        "PROGRAMMING [%.*s%s%.*s]",
-        flashed, "============================================================",
-        flashing ? ">" : "",
-        total - flashed - (flashing ? 1 : 0), "------------------------------------------------------------");*/
-    printfooterf(WHITE, BLACK, "PROGRAMMING [ %3d / %3d ]", flashed, total);
-}
-
-
-
 
 err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     TCP_CONNECT_STATE_T *con_state = (TCP_CONNECT_STATE_T*)arg;
@@ -395,17 +382,6 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
     if (p->tot_len > 0) {
         DEBUG_printf("tcp_server_recv %d err %d\n", p->tot_len, err);
 		//printlinef(WHITE, BLACK, "TCP recv %d err %d.", p->tot_len, err);
-#if 0
-        for (struct pbuf *q = p; q != NULL; q = q->next) {
-            DEBUG_printf("in: %.*s\n", q->len, q->payload);
-        }
-#endif
-        /*for (struct pbuf *q = p; q != NULL; q = q->next) {
-            printlinef(WHITE, BLUE, "in: %.*s\n", q->len, q->payload);
-        }*/
-        //printlinef(WHITE, BLUE, "RECV port=%d", pcb->remote_port);
-        //printlinef(WHITE, BLUE, "RECV addr=%s", ipaddr_ntoa(&pcb->remote_ip));
-        //printlinef(WHITE, BLUE, "RECV from %s:%d", ipaddr_ntoa(&pcb->remote_ip), pcb->remote_port);
         // Copy the request into the buffer
         pbuf_copy_partial(p, con_state->headers, p->tot_len > sizeof(con_state->headers) - 1 ? sizeof(con_state->headers) - 1 : p->tot_len, 0);
 
@@ -413,73 +389,29 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 		bool isGet = strncmp(HTTP_GET, con_state->headers, sizeof(HTTP_GET) - 1) == 0;
 		bool isPost = strncmp(HTTP_POST, con_state->headers, sizeof(HTTP_POST) - 1) == 0;
         bool isFirmwareUploadClient = (strncmp(ipaddr_ntoa(&pcb->remote_ip), fw_remote_ip, sizeof(fw_remote_ip) - 1) == 0) && pcb->remote_port == fw_remote_port;
-		bool isFirmware = strncmp(FIRMWARE_PARAM, con_state->headers, sizeof(FIRMWARE_PARAM) - 1) == 0;
         if (isGet) {
             //printlinef(WHITE, BLACK, "GET request.");
             char *request = con_state->headers + sizeof(HTTP_GET); // + space
-            char *params = strchr(request, '?');
-            if (params) {
-                if (*params) {
-                    char *space = strchr(request, ' ');
-                    *params++ = 0;
-                    if (space) {
-                        *space = 0;
-                    }
-                } else {
-                    params = NULL;
-                }
-            }
 
-            // Generate content
-            con_state->result_len = test_server_content(request, params, con_state->result, sizeof(con_state->result));
-            DEBUG_printf("Request: %s?%s\n", request, params);
-            //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
-            DEBUG_printf("Result: %d\n", con_state->result_len);
-            //printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
-
-			// Check we had enough buffer space
-			if (con_state->result_len > sizeof(con_state->result) - 1) {
-				DEBUG_printf("Too much result data %d\n", con_state->result_len);
-				return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
-			}
-
-			// Generate web page
-			if (con_state->result_len > 0) {
-				con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS,
-					200, con_state->result_len);
-				if (con_state->header_len > sizeof(con_state->headers) - 1) {
-					DEBUG_printf("Too much header data %d\n", con_state->header_len);
-					return tcp_close_client_connection(con_state, pcb, ERR_CLSD);
-				}
-			} else {
+            if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
+                // Main page
+                char* progname = (fw_info_slot1.exists && fw_info_slot1.prog_name != 0) ? fw_info_slot1.prog_name : "";
+                char* progdate = (fw_info_slot1.exists && fw_info_slot1.prog_date != 0) ? fw_info_slot1.prog_date : "";
+                con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY, progname, progdate, OTA_PATH, BOOT_PATH);
+                con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
+                send_response(con_state, pcb);
+            } else {
 				// Send redirect
-				con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_REDIRECT,
-					ipaddr_ntoa(con_state->gw));
+				con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_REDIRECT, ipaddr_ntoa(con_state->gw));
+                send_response(con_state, pcb);
 				DEBUG_printf("Sending redirect %s", con_state->headers);
-			}
-
-			// Send the headers to the client
-			con_state->sent_len = 0;
-			err_t err = tcp_write(pcb, con_state->headers, con_state->header_len, 0);
-			if (err != ERR_OK) {
-				DEBUG_printf("failed to write header data %d\n", err);
-				return tcp_close_client_connection(con_state, pcb, err);
-			}
-
-			// Send the body to the client
-			if (con_state->result_len) {
-				err = tcp_write(pcb, con_state->result, con_state->result_len, 0);
-				if (err != ERR_OK) {
-					DEBUG_printf("failed to write result data %d\n", err);
-					return tcp_close_client_connection(con_state, pcb, err);
-				}
 			}
         } else if (isPost) {
             //printlinef(WHITE, BLACK, "POST request.");
             char *request = con_state->headers + sizeof(HTTP_POST); // + space
-            //printlinef(WHITE, BLACK, "BODY: len=%d tot_len=%d", p->len, p->tot_len);
 
             if (strncmp(request, OTA_PATH, sizeof(OTA_PATH) - 1) == 0) {
+                // Form submitted
                 printlinef(WHITE, BLACK, "Upload POST request.");
 
                 // Parse Content-Length
@@ -504,7 +436,9 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                 }
                 if (content_len <= 0) {
                     printlinef(WHITE, RED, "Could not parse Content-Length header.");
-                    // TODO Return HTTP Error 400 Bad Request
+                    con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), HTTP_400);
+                    con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "400 Bad Request", con_state->result_len);
+                    send_response(con_state, pcb);
                 } else {
                     printlinef(WHITE, BLACK, "Content-Length=%d", content_len);
 
@@ -525,22 +459,18 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
                     print_progress(false, 0, fw_total_sectors);
 
-                    //DEBUG_printf("Request: %s?%s\n", request, params);
-                    //printlinef(WHITE, BLACK, "Request: %s?%s", request, params);
-                    //DEBUG_printf("Result: %d\n", con_state->result_len);
-                    //printlinef(WHITE, BLACK, "Response: %d", con_state->result_len);
-
-                    // FIXME DON'T SEND RESPONSE JUST YET --> WAIT FOR FILE UPLOAD !!!
+                    // No response is sent back, waiting for file upload...
                 }
 
             } else if (strncmp(request, BOOT_PATH, sizeof(BOOT_PATH) - 1) == 0) {
                 printlinef(WHITE, GREEN, "Booting stage 2...");
                 boot_stage2();
+            } else {
+                // Not found
+                con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), HTTP_404);
+                con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "404 Not Found", con_state->result_len);
+                send_response(con_state, pcb);
             }
-        } else if (isFirmware) {
-            printlinef(WHITE, BLACK, "FW: len=%d tot_len=%d", p->len, p->tot_len);
-            // TODO need to ack the tcp packet to get follow-ups?
-            // TODO parse multipart-form-data + parse uf2 + program flash
         }
         
         if (isFirmwareUploadClient) {
@@ -550,7 +480,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             fw_packets_received++;
             fw_total_received += p->tot_len;
             //printlinef(WHITE, RED, "RECVd: %d / %d", fw_total_received, fw_total_length);
-            if (fw_packets_received > 2) { // FIXME HACK second follow up contains the beginning of uploaded file --> start buffering and flashing
+            if (fw_packets_received > 2) {
                 // Collect enough packet data to fill 4KB buffer
                 uint16_t available = sizeof(fw_buffer) - fw_buffer_filled;
                 uint16_t read = p->tot_len > available ? available : p->tot_len;
@@ -575,7 +505,6 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                 }
                 
                 // FIXME HACK Last packet ends with boundary --> should be ignored. can be flashed anyway since it's after the firmware ¯\(ツ)/¯
-                // FIXME HACK Detect last packet based on received bytes vs expected bytes
                 if (fw_total_received >= fw_total_length) {
                     //printlinef(WHITE, RED, "PROGRAM LAST SECTOR %d: len=%d", fw_flash_sector, fw_buffer_filled);
                     print_progress(true, fw_flash_sector, fw_total_sectors);
@@ -585,13 +514,16 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                     print_progress(false, fw_flash_sector, fw_total_sectors);
 
                     // Generate result
-                    // TODO Send HTTP response !
                     if (fw_flash_ok) {
                         printlinef(WHITE, GREEN, "Upgrade successful!");
-                        // FIXME len = snprintf(result, max_result_len, OTA_BODY_SUCCESS);
+                        con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_SUCCESS);
+                        con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
+                        send_response(con_state, pcb);
                     } else {
                         printlinef(WHITE, RED, "Upgrade failed!");
-                        // FIXME len = snprintf(result, max_result_len, OTA_BODY_FAILURE);
+                        con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_FAILURE);
+                        con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
+                        send_response(con_state, pcb);
                     }
 
                     fw_recv = false;
@@ -679,16 +611,9 @@ static bool tcp_server_open(void *arg) {
 
 
 
-typedef struct firmware_info_t {
-    bool exists;
-    char* prog_name;
-    char* prog_version;
-    char* prog_date;
-    char* sdk_version;
-    char* pico_board;
-} firmware_info_t;
-
-firmware_info_t fw_info_slot1;
+/*************************************/
+/**********   BINARY INFO   **********/
+/*************************************/
 
 uint32_t* find_binary_info() {
     for (int i=0x100; i<0x200; i+=4) {
@@ -755,6 +680,83 @@ void get_firmware_info() {
 }
 
 
+
+/*************************************/
+/**********    HAND-OVER    **********/
+/*************************************/
+
+void disable_interrupts(void)
+{
+    //printlinef(WHITE, BLACK, "disable_interrupts");
+    systick_hw->csr &= ~1;
+    nvic_hw->icer = 0xFFFFFFFF;
+    nvic_hw->icpr = 0xFFFFFFFF;
+}
+
+void reset_peripherals(void)
+{
+    //printlinef(WHITE, BLACK, "reset_peripherals");
+    reset_block(~(
+            RESETS_RESET_IO_QSPI_BITS |
+            RESETS_RESET_PADS_QSPI_BITS |
+            RESETS_RESET_SYSCFG_BITS |
+            RESETS_RESET_PLL_SYS_BITS
+    ));
+}
+
+void jump_to_vtor(uint32_t vtor)
+{
+    //printlinef(WHITE, BLACK, "jump_to_vtor: 0x%08x", vtor);
+	uint32_t reset_vector = *(volatile uint32_t *)(vtor + 0x04);
+    //printlinef(WHITE, BLACK, "reset_vector=0x%08x", reset_vector);
+    //printlinef(WHITE, BLACK, "msb=0x%08x", (*(volatile uint32_t *)vtor));
+    //printlinef(WHITE, BLACK, "bx 0x%08x", reset_vector);
+	scb_hw->vtor = (volatile uint32_t)(vtor);
+    asm volatile("msr msp, %0"::"g"
+            (*(volatile uint32_t *)vtor));
+    asm volatile("bx %0"::"r" (reset_vector));
+}
+
+void boot_stage2() {
+    uint32_t vtor = XIP_BASE + 0x100000 + 0x100;
+
+    // Stop network stuff
+    dns_server_deinit(&dns_server);
+    dhcp_server_deinit(&dhcp_server);
+    tcp_server_close(state);
+    cyw43_arch_deinit();
+
+    // Halt core1
+    //printlinef(WHITE, BLACK, "multicore_reset_core1");
+    multicore_reset_core1();
+
+    // Reset system clock
+    //printlinef(WHITE, BLACK, "set_sys_clock_khz: %d KHz", 125000);
+    set_sys_clock_khz(125000, true);
+
+    // Reset voltage
+    //printlinef(WHITE, BLACK, "vreg_set_voltage(1.1V): %d", VREG_VOLTAGE_DEFAULT);
+    vreg_set_voltage(VREG_VOLTAGE_DEFAULT);
+
+    // Disable all interrupts
+    disable_interrupts();
+
+    // Reset peripherals
+    reset_peripherals();
+
+    // TODO Replace crt0.S
+    //  --> copy .data from FLASH to RAM (__data_start__ to __data_end__ ==> __etext)
+    //  --> copy .scratch_x from FLASH to RAM (__scratch_x_start__ to __scratch_x_end__ ==> __scratch_x_source__)
+    //  --> copy .scratch_y from FLASH to RAM (__scratch_y_start__ to __scratch_y_end__ ==> __scratch_y_source__)
+    //  --> clear .bss (__bss_start__ to __bss_end__ = 0)
+    // TODO Jump directly to entry_point
+    // Point to application vector table, set MSP and jump PC to reset handler
+    jump_to_vtor(vtor);
+    __builtin_unreachable();
+}
+
+
+
 int main() {
     // TODO Check for forced upgrade (joybus buttons combination or magic value)
     
@@ -807,7 +809,7 @@ int main() {
         }
     }
 
-    TCP_SERVER_T *state = calloc(1, sizeof(TCP_SERVER_T));
+    state = calloc(1, sizeof(TCP_SERVER_T));
     if (!state) {
         DEBUG_printf("failed to allocate state\n");
         return 1;
@@ -829,13 +831,11 @@ int main() {
     IP4_ADDR(ip_2_ip4(&mask), 255, 255, 255, 0);
 
     // Start the dhcp server
-    dhcp_server_t dhcp_server;
 	printlinef(WHITE, BLACK, "Starting DHCP server...");
     dhcp_server_init(&dhcp_server, &state->gw, &mask);
 	printlinef(WHITE, GREEN, "DHCP server started.");
 
     // Start the dns server
-    dns_server_t dns_server;
 	printlinef(WHITE, BLACK, "Starting DNS server...");
     dns_server_init(&dns_server, &state->gw);
 	printlinef(WHITE, GREEN, "DNS server started.");
