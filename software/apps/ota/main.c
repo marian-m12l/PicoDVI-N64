@@ -33,6 +33,9 @@
 #include "pico/binary_info/defs.h"
 #include "pico/binary_info/structure.h"
 
+#include "joybus.h"
+#include "joybus.pio.h"
+
 
 /*************************************/
 /**********       DVI       **********/
@@ -153,6 +156,16 @@ typedef struct firmware_info_t {
 } firmware_info_t;
 
 firmware_info_t fw_info_slot1;
+
+
+/*************************************/
+/**********     JOYBUS      **********/
+/*************************************/
+
+#define PIN_JOYBUS_P1   20
+
+const PIO pio_joybus = DVI_DEFAULT_SERIAL_CONFIG.pio; // usually pio0
+const uint sm_joybus = 3; // last free sm in pio0 unless sm_tmds is set to something unusual
 
 
 
@@ -758,7 +771,25 @@ void boot_stage2() {
 
 
 int main() {
-    // TODO Check for forced upgrade (joybus buttons combination or magic value)
+	vreg_set_voltage(VREG_VSEL);
+	sleep_ms(10);
+	set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
+
+	setup_default_uart();
+
+    // TODO Check for forced bootloader/upgrade mode (joybus buttons combination or magic value)
+    gpio_init(PIN_JOYBUS_P1);
+    gpio_set_dir(PIN_JOYBUS_P1, GPIO_IN);
+    gpio_set_pulls(PIN_JOYBUS_P1, false, false);
+    uint offset_joybus = pio_add_program(pio_joybus, &joybus_program);
+    joybus_rx_program_init(pio_joybus, sm_joybus, offset_joybus, PIN_JOYBUS_P1);
+    pio_sm_set_enabled(pio_joybus, sm_joybus, true);
+    // TODO Need to wait for console to read controller? Or act as the master and send the 0x01 command?
+    uint32_t value = joybus_rx_get_latest(pio_joybus, sm_joybus);
+    if (!!Z_BUTTON(value) && !!START_BUTTON(value)) {
+        // TODO Force bootloader
+        printlinef(WHITE, BLACK, "Entering bootloader from joybus input.");
+    }
     
     // Check if there is a stage2 firmware. Boot if available
     get_firmware_info();
@@ -766,12 +797,6 @@ int main() {
     /*if (fw_info_slot1.exists) {
         boot_stage2();
     }*/
-
-	vreg_set_voltage(VREG_VSEL);
-	sleep_ms(10);
-	set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
-
-	setup_default_uart();
 
 	dvi0.timing = &DVI_TIMING;
 	dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
@@ -852,6 +877,9 @@ int main() {
 
 	while (!state->complete) {
 		fillrect(1, 1, BORDER / 2, BORDER / 2, (blinky = !blinky) ? GREEN : BLACK);
+        // FIXME Probe joybus?
+        uint32_t value = joybus_rx_get_latest(pio_joybus, sm_joybus);
+        printlinef(GREEN, BLACK, "joybus: 0x%08x", value);
         // if you are using pico_cyw43_arch_poll, then you must poll periodically from your
         // main loop (not from a timer interrupt) to check for Wi-Fi driver or lwIP work that needs to be done.
         cyw43_arch_poll();
