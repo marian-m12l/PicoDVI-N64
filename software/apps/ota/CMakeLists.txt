@@ -35,7 +35,7 @@ target_link_libraries(ota
 )
 
 # Build pio
-pico_generate_pio_header(n64 ${CMAKE_CURRENT_LIST_DIR}/joybus.pio)
+pico_generate_pio_header(ota ${CMAKE_CURRENT_LIST_DIR}/joybus.pio)
 
 # Custom linker script to load critical code to RAM (DVI stuff, ...)
 pico_set_binary_type(ota copy_to_ram)	# Needed to set PICO_COPY_TO_RAM and have boot code copy "ram_text" section to RAM
