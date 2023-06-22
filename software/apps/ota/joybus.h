@@ -4,6 +4,7 @@
 #include "hardware/pio.h"
 
 uint32_t joybus_rx_get_latest(PIO pio_instance, uint sm_instance);
+void joybus_tx(PIO pio_instance, uint sm_instance, uint tx_offset, uint8_t data);
 
 // Pad buttons
 #define A_BUTTON(a)     ((a) & 0x80000000)

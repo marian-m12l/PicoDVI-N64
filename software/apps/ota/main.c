@@ -164,9 +164,9 @@ firmware_info_t fw_info_slot1;
 
 #define PIN_JOYBUS_P1   20
 
-const PIO pio_joybus = DVI_DEFAULT_SERIAL_CONFIG.pio; // usually pio0
-const uint sm_joybus = 3; // last free sm in pio0 unless sm_tmds is set to something unusual
-
+// Use pio1 because we need the whole 32 instructions
+const PIO pio_joybus = pio1;
+const uint sm_joybus = 0;
 
 
 /*************************************/
@@ -477,7 +477,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
             } else if (strncmp(request, BOOT_PATH, sizeof(BOOT_PATH) - 1) == 0) {
                 printlinef(WHITE, GREEN, "Booting stage 2...");
-                boot_stage2();
+                deinit_and_boot_stage2();
             } else {
                 // Not found
                 con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), HTTP_404);
@@ -733,16 +733,6 @@ void jump_to_vtor(uint32_t vtor)
 void boot_stage2() {
     uint32_t vtor = XIP_BASE + 0x100000 + 0x100;
 
-    // Stop network stuff
-    dns_server_deinit(&dns_server);
-    dhcp_server_deinit(&dhcp_server);
-    tcp_server_close(state);
-    cyw43_arch_deinit();
-
-    // Halt core1
-    //printlinef(WHITE, BLACK, "multicore_reset_core1");
-    multicore_reset_core1();
-
     // Reset system clock
     //printlinef(WHITE, BLACK, "set_sys_clock_khz: %d KHz", 125000);
     set_sys_clock_khz(125000, true);
@@ -768,40 +758,31 @@ void boot_stage2() {
     __builtin_unreachable();
 }
 
+void deinit_and_boot_stage2() {
+    // Stop network stuff
+    dns_server_deinit(&dns_server);
+    dhcp_server_deinit(&dhcp_server);
+    tcp_server_close(state);
+    cyw43_arch_deinit();
+
+    // Halt core1
+    //printlinef(WHITE, BLACK, "multicore_reset_core1");
+    multicore_reset_core1();
+
+    boot_stage2();
+}
+
 
 
 int main() {
+    // Overclock
 	vreg_set_voltage(VREG_VSEL);
 	sleep_ms(10);
 	set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
 
 	setup_default_uart();
 
-    // TODO Check for forced bootloader/upgrade mode (joybus buttons combination or magic value)
-    gpio_init(PIN_JOYBUS_P1);
-    gpio_set_dir(PIN_JOYBUS_P1, GPIO_IN);
-    gpio_set_pulls(PIN_JOYBUS_P1, false, false);
-    uint offset_joybus = pio_add_program(pio_joybus, &joybus_program);
-    joybus_rx_program_init(pio_joybus, sm_joybus, offset_joybus, PIN_JOYBUS_P1);
-    pio_sm_set_enabled(pio_joybus, sm_joybus, true);
-    // TODO Need to wait for console to read controller? Or act as the master and send the 0x01 command?
-    uint32_t value = joybus_rx_get_latest(pio_joybus, sm_joybus);
-    if (!!Z_BUTTON(value) && !!START_BUTTON(value)) {
-        // TODO Force bootloader
-        printlinef(WHITE, BLACK, "Entering bootloader from joybus input.");
-    }
-    
-    // Check if there is a stage2 firmware. Boot if available
-    get_firmware_info();
-
-    /*if (fw_info_slot1.exists) {
-        boot_stage2();
-    }*/
-
-	dvi0.timing = &DVI_TIMING;
-	dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
-	dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
-
+    // Clear framebuffer
 	const int BORDER = 10;
 	for (int y = 0; y < FRAME_HEIGHT; ++y)
 		for (int x = 0; x < FRAME_WIDTH; ++x)
@@ -810,10 +791,58 @@ int main() {
 		for (int x = BORDER; x < FRAME_WIDTH - BORDER; ++x)
 			putpixel(x, y, WHITE);
 
-	puttext(204, 20, GREEN, BLACK, "Over-the-Air Firmware Upgrade");
+    // Check for forced bootloader/upgrade mode (joybus buttons combination)
+    gpio_init(PIN_JOYBUS_P1);
+    gpio_set_dir(PIN_JOYBUS_P1, GPIO_IN);
+    gpio_set_pulls(PIN_JOYBUS_P1, false, false);
+    uint offset_joybus = pio_add_program(pio_joybus, &joybus_program);
+    joybus_rx_program_init(pio_joybus, sm_joybus, offset_joybus, PIN_JOYBUS_P1);
+    pio_sm_set_enabled(pio_joybus, sm_joybus, true);
+    
+    // Send Info command
+    joybus_tx(pio_joybus, sm_joybus, offset_joybus+joybus_offset_joybus_tx_start, 0x00);
+    // Wait a little bit to make sure controller is idle (minimum: (24 data bits + 1 stop bit) * 4us --> 100us)
+	sleep_ms(1);
+    // Send Controller State command
+    joybus_tx(pio_joybus, sm_joybus, offset_joybus+joybus_offset_joybus_tx_start, 0x01);
+    // Wait a little bit to make sure controller has responded (minimum: (32 data bits + 1 stop bit) * 4us --> 132us)
+	sleep_ms(1);
+
+
+    // Check if there is a stage2 firmware. Boot if available
+    get_firmware_info();
+    bool boot_to_stage2 = fw_info_slot1.exists;
+
+    if (!fw_info_slot1.exists) {
+        printlinef(WHITE, BLACK, "Entering bootloader because no firmware is installed.");
+    }
+
+    // If buttons Z and START are held on the first controller, stay in bootloader
+    uint32_t value = joybus_rx_get_latest(pio_joybus, sm_joybus);
+    if (!!Z_BUTTON(value) && !!START_BUTTON(value)) {
+        printlinef(WHITE, BLACK, "Entering bootloader because of joybus input (Z + START).");
+        boot_to_stage2 = false;
+    }
+
+    // Boot firmware if available and no controller combo is pressed
+    if (boot_to_stage2) {
+        boot_stage2();
+        __builtin_unreachable();
+    }
+
+
+    // We are staying in the bootloader: let's-a-go!
+
+    // Enable DVI output
+	dvi0.timing = &DVI_TIMING;
+	dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+	dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
 
 	multicore_launch_core1(core1_main);
+    
 
+    // Print firmware info
+	puttext(204, 20, GREEN, BLACK, "Over-the-Air Firmware Upgrade");
 
     if (fw_info_slot1.exists) {
         printlinef(WHITE, BLACK, "Firmware is installed:");
@@ -834,6 +863,8 @@ int main() {
         }
     }
 
+
+    // Start Wi-Fi access point
     state = calloc(1, sizeof(TCP_SERVER_T));
     if (!state) {
         DEBUG_printf("failed to allocate state\n");
@@ -877,15 +908,24 @@ int main() {
 
 	while (!state->complete) {
 		fillrect(1, 1, BORDER / 2, BORDER / 2, (blinky = !blinky) ? GREEN : BLACK);
-        // FIXME Probe joybus?
+        // Press START to boot firmware (if available)
         uint32_t value = joybus_rx_get_latest(pio_joybus, sm_joybus);
-        printlinef(GREEN, BLACK, "joybus: 0x%08x", value);
+        if (!Z_BUTTON(value) && !!START_BUTTON(value)) {
+            get_firmware_info();
+            if (!fw_info_slot1.exists) {
+                printlinef(WHITE, RED, "No firmware available.");
+            } else {
+                printlinef(WHITE, GREEN, "Booting firmware...");
+                deinit_and_boot_stage2();
+                __builtin_unreachable();
+            }
+        }
         // if you are using pico_cyw43_arch_poll, then you must poll periodically from your
         // main loop (not from a timer interrupt) to check for Wi-Fi driver or lwIP work that needs to be done.
         cyw43_arch_poll();
         // you can poll as often as you like, however if you have nothing else to do you can
         // choose to sleep until either a specified time, or cyw43_arch_poll() has work to do:
-        cyw43_arch_wait_for_work_until(make_timeout_time_ms(1000));
+        cyw43_arch_wait_for_work_until(make_timeout_time_ms(100));
 	}
     dns_server_deinit(&dns_server);
     dhcp_server_deinit(&dhcp_server);

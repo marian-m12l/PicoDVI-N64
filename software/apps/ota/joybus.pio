@@ -61,6 +61,7 @@ check_command:
     wait 0 pin 0
     wait 1 pin 0
 
+rx_controller_state:
     ; Simplified version of the code above.
     ; Assume that we always will get 32 bits, don't care about error cases.
 
@@ -74,6 +75,19 @@ rx_bit_loop2:
 public joybus_rx_wrap:
     jmp x-- rx_bit_loop2 [12]
 
+public joybus_tx_start:
+    out isr, 8      ; Read command size (always 8 bits)
+    ;in null, 3     ; No need to multiply size by 8 --> already a number of *bits*, not bytes
+    mov x, isr      ; X = 8
+tx_bit_loop:
+    set pindirs, 0 [7]      ; Enable pin output (because Output Enable is inverted) --> LOW for 1us
+    jmp !x tx_stop          ; Done writing 8 bits?
+    out pindirs, 1 [14]     ; If outputting a 0, keep pin output enabled (LOW), if outputting a 1, disable pin output (pulled HIGH by the GPIO pull-up)
+    set pindirs, 1 [7]      ; Disable pin output (because Output Enable is inverted) --> HIGH for 1us
+    jmp x-- tx_bit_loop     ; To next bit
+tx_stop:
+    set pindirs, 1          ; Disable pin output to release the line
+    jmp rx_controller_state ; Now read the controller's response to command 0x01
 
 
 % c-sdk {
@@ -87,14 +101,21 @@ void joybus_rx_program_init(PIO pio, uint sm, uint offset, uint pin)
 
     sm_config_set_in_pins(&c, pin);
     sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_set_pins(&c, pin, 1);
 
     sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_out_shift(&c, false, true, 16);
 
     float div = ((float) (clock_get_hz(clk_sys))) / (32 * 250000);
     sm_config_set_clkdiv(&c, div);
 
     gpio_pull_up(pin);
+    pio_sm_set_pins_with_mask(pio, sm, (1 << pin), (1 << pin));
+    pio_sm_set_pindirs_with_mask(pio, sm, (1 << pin), (1 << pin));
     pio_gpio_init(pio, pin);
+    gpio_set_oeover(pin, GPIO_OVERRIDE_INVERT);
+    pio_sm_set_pins_with_mask(pio, sm, 0, (1 << pin));
 
     pio_sm_init(pio, sm, offset + joybus_offset_joybus_rx_start, &c);
 
