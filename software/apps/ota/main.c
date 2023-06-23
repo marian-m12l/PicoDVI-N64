@@ -25,6 +25,8 @@
 #include "dhcpserver.h"
 #include "dnsserver.h"
 
+#include "content.h"
+
 #include "hardware/resets.h"
 #include "hardware/structs/scb.h"
 #include "hardware/structs/nvic.h"
@@ -83,17 +85,6 @@ uint16_t line = FIRST_LINE;
 #define TCP_PORT 80
 #define DEBUG_printf printf
 #define POLL_TIME_S 5
-#define HTTP_GET "GET"
-#define HTTP_POST "POST"
-#define OTA_PATH "/ota"
-#define BOOT_PATH "/boot"
-#define HTTP_RESPONSE_HEADERS "HTTP/1.1 %s\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define OTA_BODY "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><p>Installed: %s</p><p>Build date: %s</p><form method=\"POST\" action=\"%s\" enctype=\"multipart/form-data\"><input type=\"file\" id=\"firmware\" name=\"firmware\"/><input type=\"submit\" value=\"Upgrade\" /></form><form method=\"POST\" action=\"%s\"><input type=\"submit\" value=\"Boot stage 2\" /></form></body></html>"
-#define OTA_BODY_SUCCESS "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade successful!</h2><p><a href=\"" OTA_PATH "\">Back</a></p></body></html>"
-#define OTA_BODY_FAILURE "<html><body><h1>Over-the-Air Firmware Upgrade.</h1><h2>Upgrade Failed!</h2><p><a href=\"" OTA_PATH "\">Back</a></p></body></html>"
-#define HTTP_400 "<html><body>Bad Request</body></html>"
-#define HTTP_404 "<html><body>Not Found</body></html>"
-#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" OTA_PATH "\n\n"
 
 typedef struct TCP_SERVER_T_ {
     struct tcp_pcb *server_pcb;
@@ -105,7 +96,7 @@ typedef struct TCP_CONNECT_STATE_T_ {
     struct tcp_pcb *pcb;
     int sent_len;
     char headers[128];
-    char result[512];
+    char result[2048];
     int header_len;
     int result_len;
     ip_addr_t *gw;
@@ -410,7 +401,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                 // Main page
                 char* progname = (fw_info_slot1.exists && fw_info_slot1.prog_name != 0) ? fw_info_slot1.prog_name : "";
                 char* progdate = (fw_info_slot1.exists && fw_info_slot1.prog_date != 0) ? fw_info_slot1.prog_date : "";
-                con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY, progname, progdate, OTA_PATH, BOOT_PATH);
+                con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY, LOGO_SVG, progname, progdate);
                 con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
                 send_response(con_state, pcb);
             } else {
@@ -529,12 +520,12 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                     // Generate result
                     if (fw_flash_ok) {
                         printlinef(WHITE, GREEN, "Upgrade successful!");
-                        con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_SUCCESS);
+                        con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_SUCCESS, LOGO_SVG);
                         con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
                         send_response(con_state, pcb);
                     } else {
                         printlinef(WHITE, RED, "Upgrade failed!");
-                        con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_FAILURE);
+                        con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_FAILURE, LOGO_SVG);
                         con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
                         send_response(con_state, pcb);
                     }

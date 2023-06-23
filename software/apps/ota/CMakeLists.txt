@@ -5,6 +5,7 @@
 add_executable(ota
 	main.c
 	joybus.c
+	content.c
 	dhcpserver/dhcpserver.c
 	dnsserver/dnsserver.c
 )
