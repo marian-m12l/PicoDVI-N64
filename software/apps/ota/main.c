@@ -208,11 +208,16 @@ void puttextf(uint x0, uint y0, uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_end(args);
 }
 
-void ffw() {
-    line += 10;
-    if (line > LAST_LINE) {
-        line = FIRST_LINE;
+uint16_t nextline() {
+    uint16_t next = line + 10;
+    if (next > LAST_LINE) {
+        next = FIRST_LINE;
     }
+    return next;
+}
+
+void ffw() {
+    line = nextline();
 }
 
 void rwd() {
@@ -226,7 +231,7 @@ void printlinef(uint bgcol, uint fgcol, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
 	puttextf_valist(LABEL_LEFT, line, bgcol, fgcol, fmt, args);
-	puttextf_valist(LABEL_LEFT, line+10, WHITE, WHITE, "                                                                            ", args);
+	puttextf_valist(LABEL_LEFT, nextline(), WHITE, WHITE, "                                                                            ", args);
 	ffw();
 	va_end(args);
 }
@@ -293,12 +298,13 @@ bool program_flash_sector() {
         if (fw_buffer[i] != programmed_content[i])
             mismatch = true;
     }
-    if (mismatch)
+    if (mismatch) {
         printlinef(WHITE, RED, "PROGRAM of sector %d @ 0x%08x FAILED", fw_flash_sector, offset);
-    else
+    } else {
         printlinef(WHITE, GREEN, "PROGRAM of sector %d @ 0x%08x SUCCEEDED", fw_flash_sector, offset);
-	
-	return mismatch;
+    }
+    
+    return mismatch;
 }
 
 
@@ -347,7 +353,7 @@ static err_t tcp_server_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
     return ERR_OK;
 }
 
-void send_response(TCP_CONNECT_STATE_T* con_state, struct tcp_pcb* pcb) {
+err_t send_response(TCP_CONNECT_STATE_T* con_state, struct tcp_pcb* pcb) {
     // Check we had enough buffer space
     if (con_state->result_len > sizeof(con_state->result) - 1) {
         DEBUG_printf("Too much result data %d\n", con_state->result_len);
@@ -374,6 +380,8 @@ void send_response(TCP_CONNECT_STATE_T* con_state, struct tcp_pcb* pcb) {
             return tcp_close_client_connection(con_state, pcb, err);
         }
     }
+
+    return ERR_OK;
 }
 
 err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
@@ -419,7 +427,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                 printlinef(WHITE, BLACK, "Upload POST request.");
 
                 // Parse Content-Length
-                int content_len;
+                int content_len = 0;
                 char* find_in = p->payload;
                 char* crlfcrlf = strnstr(find_in, CRLF CRLF, p->len);
                 if (crlfcrlf != NULL) {
@@ -523,11 +531,17 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                         con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_SUCCESS, LOGO_SVG);
                         con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
                         send_response(con_state, pcb);
+                        // Refresh installed firmware info
+                        get_firmware_info();
+                        print_firmware_info();
                     } else {
                         printlinef(WHITE, RED, "Upgrade failed!");
                         con_state->result_len = snprintf(con_state->result, sizeof(con_state->result), OTA_BODY_FAILURE, LOGO_SVG);
                         con_state->header_len = snprintf(con_state->headers, sizeof(con_state->headers), HTTP_RESPONSE_HEADERS, "200 OK", con_state->result_len);
                         send_response(con_state, pcb);
+                        // Refresh installed firmware info
+                        get_firmware_info();
+                        print_firmware_info();
                     }
 
                     fw_recv = false;
@@ -594,7 +608,7 @@ static bool tcp_server_open(void *arg) {
 
     err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_PORT);
     if (err) {
-        DEBUG_printf("failed to bind to port %d\n");
+        DEBUG_printf("failed to bind to port %d\n", TCP_PORT);
         return false;
     }
 
@@ -680,6 +694,29 @@ void get_firmware_info() {
                     break;
             }
         }
+    }
+}
+
+void print_firmware_info() {
+    if (fw_info_slot1.exists) {
+        printlinef(WHITE, BLACK, "Firmware is installed:");
+        if (fw_info_slot1.prog_name != 0) {
+            printlinef(WHITE, BLACK, "  PROGRAM NAME: %s", fw_info_slot1.prog_name);
+        }
+        if (fw_info_slot1.prog_version != 0) {
+            printlinef(WHITE, BLACK, "  PROGRAM VERSION: %s", fw_info_slot1.prog_version);
+        }
+        if (fw_info_slot1.prog_date != 0) {
+            printlinef(WHITE, BLACK, "  PROGRAM DATE: %s", fw_info_slot1.prog_date);
+        }
+        if (fw_info_slot1.sdk_version != 0) {
+            printlinef(WHITE, BLACK, "  SDK VERSION: %s", fw_info_slot1.sdk_version);
+        }
+        if (fw_info_slot1.pico_board != 0) {
+            printlinef(WHITE, BLACK, "  PICO BOARD: %s", fw_info_slot1.pico_board);
+        }
+    } else {
+        printlinef(WHITE, RED, "No firmware is installed.");
     }
 }
 
@@ -835,24 +872,7 @@ int main() {
     // Print firmware info
 	puttext(204, 20, GREEN, BLACK, "Over-the-Air Firmware Upgrade");
 
-    if (fw_info_slot1.exists) {
-        printlinef(WHITE, BLACK, "Firmware is installed:");
-        if (fw_info_slot1.prog_name != 0) {
-            printlinef(WHITE, BLACK, "  PROGRAM NAME: %s", fw_info_slot1.prog_name);
-        }
-        if (fw_info_slot1.prog_version != 0) {
-            printlinef(WHITE, BLACK, "  PROGRAM VERSION: %s", fw_info_slot1.prog_version);
-        }
-        if (fw_info_slot1.prog_date != 0) {
-            printlinef(WHITE, BLACK, "  PROGRAM DATE: %s", fw_info_slot1.prog_date);
-        }
-        if (fw_info_slot1.sdk_version != 0) {
-            printlinef(WHITE, BLACK, "  SDK VERSION: %s", fw_info_slot1.sdk_version);
-        }
-        if (fw_info_slot1.pico_board != 0) {
-            printlinef(WHITE, BLACK, "  PICO BOARD: %s", fw_info_slot1.pico_board);
-        }
-    }
+    print_firmware_info();
 
 
     // Start Wi-Fi access point
